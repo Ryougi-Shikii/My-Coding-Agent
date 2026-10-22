@@ -1,0 +1,820 @@
+"""Agent tools, approval policy and per-stage tool allow-lists.
+
+Every file operation is confined to WORKSPACE. Tools return plain strings; a failure is a
+string starting with "ERROR" (the graph marks such ToolMessages with status="error").
+"""
+
+from __future__ import annotations
+
+import ast
+import functools
+import hashlib
+import os
+import re
+import stat
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+
+from agent import PROJECT_ROOT, sandbox
+from agent.llm import content_to_text, get_chat_model
+from agent.prompts import REVIEW_PROMPT
+
+# ---------------------------------------------------------------------------
+# Workspace
+# ---------------------------------------------------------------------------
+
+
+def _resolve_workspace() -> Path:
+    path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path  # relative paths are relative to the project root
+    return path.resolve()
+
+
+WORKSPACE: Path = _resolve_workspace()
+
+IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
+MAX_READ_CHARS = 60_000
+MAX_WRITE_CHARS = 1_000_000
+MAX_OUTPUT_CHARS = 20_000
+MAX_LIST_ENTRIES = 300
+MAX_SEARCH_MATCHES = 100
+
+
+def ensure_workspace(root: Path | None = None) -> Path:
+    """Create the workspace, its .agent state directory and the reviews directory."""
+    root = root or WORKSPACE
+    (root / ".agent" / "reviews").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+ensure_workspace()
+
+
+class PathError(ValueError):
+    """Raised when a path escapes the workspace or targets a protected file."""
+
+
+def safe_path(path: str | None = "") -> Path:
+    """Resolve `path` inside the workspace or raise PathError.
+
+    Symlinks are resolved before the check, so a link that points outside is rejected.
+    """
+    path = path or ""
+    if "\x00" in path:
+        raise PathError("invalid path")
+    root = WORKSPACE.resolve()
+    candidate = Path(path).expanduser() if path.startswith("~") else Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    if resolved != root and not resolved.is_relative_to(root):
+        raise PathError(f"path '{path}' is outside the workspace")
+    return resolved
+
+
+def _rel(path: Path) -> str:
+    rel = path.relative_to(WORKSPACE.resolve()).as_posix()
+    return rel or "."
+
+
+def is_git_name(name: str) -> bool:
+    """True for '.git' however a filesystem may spell it (case-insensitive FS, NTFS/HFS quirks)."""
+    lowered = name.lower().rstrip(". ")
+    return lowered in (".git", "git~1")
+
+
+def _is_regular_file(path: Path) -> bool:
+    """A real file (not a symlink, FIFO, device or directory). lstat never follows links."""
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _read_capped(path: Path, max_bytes: int) -> tuple[str, bool]:
+    """Read at most `max_bytes` from a regular file; returns (text, was_truncated)."""
+    with path.open("rb") as handle:
+        raw = handle.read(max_bytes + 1)
+    return raw[:max_bytes].decode("utf-8", errors="replace"), len(raw) > max_bytes
+
+
+def assert_writable(path: Path) -> None:
+    """Refuse writes to git internals and to the sandbox image pointer."""
+    rel = Path(_rel(path))
+    if any(is_git_name(part) for part in rel.parts):
+        raise PathError("the .git directory is protected; use the git tools instead")
+    if rel.as_posix() == ".agent/sandbox_image.txt":
+        raise PathError("sandbox_image.txt is managed by install_packages and cannot be edited")
+
+
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [truncated {len(text) - limit} characters]"
+
+
+def _safe_tool(fn):
+    """Turn path/OS errors into 'ERROR: ...' strings instead of exceptions."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except PathError as exc:
+            return f"ERROR: {exc}"
+        except OSError as exc:
+            return f"ERROR: {type(exc).__name__}: {exc}"
+
+    return wrapper
+
+
+def is_error_text(text: str) -> bool:
+    return str(text).lstrip().startswith("ERROR")
+
+
+# ---------------------------------------------------------------------------
+# File tools
+# ---------------------------------------------------------------------------
+@tool
+@_safe_tool
+def list_files(path: str = "") -> str:
+    """List files and directories under `path` (relative to the workspace, default: root).
+    Directories end with '/'. Skips .git, __pycache__ and similar noise."""
+    base = safe_path(path)
+    if not base.exists():
+        return f"ERROR: '{path}' does not exist"
+    if base.is_file():
+        return _rel(base)
+    entries: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+        here = Path(dirpath)
+        for name in dirnames:
+            entries.append(_rel(here / name) + "/")
+        for name in sorted(filenames):
+            entries.append(_rel(here / name))
+        if len(entries) > MAX_LIST_ENTRIES:
+            break
+    entries.sort()
+    if not entries:
+        return "(empty)"
+    if len(entries) > MAX_LIST_ENTRIES:
+        return "\n".join(entries[:MAX_LIST_ENTRIES]) + "\n... (truncated)"
+    return "\n".join(entries)
+
+
+@tool
+@_safe_tool
+def read_file(path: str) -> str:
+    """Read a UTF-8 text file from the workspace and return its contents."""
+    target = safe_path(path)
+    if not _is_regular_file(target):  # also rejects FIFOs/devices that could block forever
+        return f"ERROR: '{path}' is not a regular file"
+    # Read a bounded amount: sandboxed code can create arbitrarily large files.
+    text, truncated = _read_capped(target, MAX_READ_CHARS * 4)
+    if len(text) > MAX_READ_CHARS or truncated:
+        return text[:MAX_READ_CHARS] + "\n... [truncated: the file is larger than the read limit]"
+    return text
+
+
+@tool
+@_safe_tool
+def write_file(path: str, content: str) -> str:
+    """Create or overwrite a file in the workspace with `content`. Parent directories are
+    created. Requires human approval."""
+    target = safe_path(path)
+    assert_writable(target)
+    if target.is_dir():
+        return f"ERROR: '{path}' is a directory"
+    if target.exists() and not _is_regular_file(target):  # e.g. a FIFO would block the write
+        return f"ERROR: '{path}' exists and is not a regular file"
+    if len(content) > MAX_WRITE_CHARS:
+        return f"ERROR: content too large (max {MAX_WRITE_CHARS} characters)"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"Wrote {len(content)} characters to {_rel(target)}"
+
+
+@tool
+@_safe_tool
+def edit_file(path: str, find: str, replace: str, replace_all: bool = False) -> str:
+    """Replace the text `find` with `replace` in an existing file. `find` must match exactly
+    once unless replace_all=True. Read the file first so `find` is exact. Requires approval."""
+    target = safe_path(path)
+    assert_writable(target)
+    if not _is_regular_file(target):
+        return f"ERROR: '{path}' is not a regular file"
+    if target.stat().st_size > MAX_WRITE_CHARS * 2:
+        return f"ERROR: '{path}' is too large to edit"
+    if not find:
+        return "ERROR: 'find' must not be empty"
+    text = target.read_text(encoding="utf-8")
+    count = text.count(find)
+    if count == 0:
+        return "ERROR: 'find' text not found. Re-read the file and copy the text exactly."
+    if count > 1 and not replace_all:
+        return (f"ERROR: 'find' matches {count} places. Add more surrounding context "
+                f"or pass replace_all=true.")
+    target.write_text(text.replace(find, replace) if replace_all else text.replace(find, replace, 1),
+                      encoding="utf-8")
+    return f"Replaced {count if replace_all else 1} occurrence(s) in {_rel(target)}"
+
+
+@tool
+@_safe_tool
+def create_directory(path: str) -> str:
+    """Create a directory (and parents) inside the workspace. Requires human approval."""
+    target = safe_path(path)
+    assert_writable(target)
+    target.mkdir(parents=True, exist_ok=True)
+    return f"Created directory {_rel(target)}"
+
+
+@tool
+@_safe_tool
+def search_text(query: str, path: str = "") -> str:
+    """Case-insensitive text search in files under `path` (default: whole workspace).
+    Returns up to 100 matches as 'file:line: text'."""
+    if not query:
+        return "ERROR: query must not be empty"
+    base = safe_path(path)
+    if not base.exists():
+        return f"ERROR: '{path}' does not exist"
+    needle = query.lower()
+    matches: list[str] = []
+
+    def files():
+        if base.is_file():
+            yield base
+            return
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+            for name in sorted(filenames):
+                yield Path(dirpath) / name
+
+    for file in files():
+        # Regular files only: symlinks, FIFOs and devices (which sandboxed code can create)
+        # could block forever or read unbounded data.
+        if not _is_regular_file(file):
+            continue
+        try:
+            text, too_big = _read_capped(file, 1_000_000)
+        except OSError:
+            continue
+        if too_big or "\x00" in text[:2048]:  # large or binary
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            if needle in line.lower():
+                try:
+                    shown = _rel(file.resolve())
+                except ValueError:  # symlink pointing outside: skip
+                    break
+                matches.append(f"{shown}:{number}: {line.strip()[:200]}")
+                if len(matches) >= MAX_SEARCH_MATCHES:
+                    return "\n".join(matches) + "\n... (stopped at 100 matches)"
+    return "\n".join(matches) if matches else "No matches."
+
+
+# ---------------------------------------------------------------------------
+# Execution tools
+# ---------------------------------------------------------------------------
+@tool
+@_safe_tool
+def run_python_file(path: str) -> str:
+    """Run a workspace .py file inside the Docker sandbox (no network, 512 MB, timeout).
+    Returns exit code, stdout and stderr. Requires human approval."""
+    return str(sandbox.run_python_in_sandbox(WORKSPACE, path))
+
+
+@tool
+@_safe_tool
+def check_python_syntax(path: str) -> str:
+    """Check Python syntax of a file, or of every .py file under a directory, without running
+    it. Safe: only parses the code."""
+    target = safe_path(path)
+    if not target.exists():
+        return f"ERROR: '{path}' does not exist"
+    if target.is_file():
+        files = [target]
+    else:
+        files = []
+        for dirpath, dirnames, filenames in os.walk(target):
+            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+            files += [Path(dirpath) / n for n in sorted(filenames) if n.endswith(".py")]
+    # Regular files only (no symlinks that could point outside, no FIFOs/devices).
+    files = [f for f in files if _is_regular_file(f)]
+    if not files:
+        return "No Python files found."
+    problems: list[str] = []
+    for file in files:
+        source, too_big = _read_capped(file, 2_000_000)
+        if too_big:
+            problems.append(f"{_rel(file)}: file too large to check")
+            continue
+        try:
+            ast.parse(source, filename=str(file))
+        except (SyntaxError, ValueError) as exc:  # ValueError: e.g. null bytes in source
+            line = getattr(exc, "lineno", None) or 1
+            message = getattr(exc, "msg", None) or str(exc)
+            problems.append(f"{_rel(file)}:{line}: SyntaxError: {message}")
+    if problems:
+        return "ERROR: syntax problems found:\n" + "\n".join(problems)
+    return f"Syntax OK ({len(files)} file(s) checked)."
+
+
+@tool
+@_safe_tool
+def run_tests(path: str = "") -> str:
+    """Run pytest inside the Docker sandbox, optionally limited to `path`. Requires approval.
+    If pytest is missing in the sandbox image, install it with install_packages('pytest')."""
+    args = ["-m", "pytest", "-o", "cache_dir=/tmp/pytest_cache", "-q"]
+    if path:
+        rel = _rel(safe_path(path))
+        args.append("." if rel == "." else "./" + rel)
+    result = sandbox.run_python_args_in_sandbox(WORKSPACE, args, timeout=sandbox.test_timeout())
+    text = str(result)
+    if "No module named pytest" in text:
+        text += "\nHint: pytest is not installed in the sandbox image. Call install_packages('pytest')."
+    return text
+
+
+@tool
+@_safe_tool
+def install_packages(packages: str) -> str:
+    """Install pip packages by building a NEW Docker sandbox image from the current one.
+    `packages` is space-separated requirements, e.g. 'pytest requests>=2.31'. Requires approval."""
+    return sandbox.install_packages_into_sandbox_image(WORKSPACE, packages.split())
+
+
+# ---------------------------------------------------------------------------
+# Git tools (subprocess without a shell, always inside WORKSPACE)
+# ---------------------------------------------------------------------------
+def _git_env() -> dict[str, str]:
+    env = dict(os.environ)
+    # Never walk up into a parent repository (the workspace may live inside another repo).
+    env["GIT_CEILING_DIRECTORIES"] = str(WORKSPACE.resolve().parent)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+# Config keys a repository created by git_init (plus our identity fallback) may contain.
+# Anything else (filter.*, diff.*.command, alias.*, core.sshCommand, include.path, ...) can make
+# git run programs, and sandboxed code can create a .git directory before git_init ever runs.
+_SAFE_CONFIG_KEYS = frozenset({
+    "core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates",
+    "core.ignorecase", "core.precomposeunicode", "core.symlinks",
+    "user.name", "user.email",
+})
+
+
+def _repo_problem() -> str | None:
+    """None if there is no .git or it looks like a plain, trustworthy repository."""
+    gitdir = WORKSPACE.resolve() / ".git"
+    if not os.path.lexists(gitdir):
+        return None
+    if gitdir.is_symlink() or not gitdir.is_dir():
+        return ".git must be a real directory inside the workspace"
+    for extra in ("commondir", "objects/info/alternates"):
+        if (gitdir / extra).exists():
+            return f".git/{extra} is not allowed"
+    config = gitdir / "config"
+    if config.exists():
+        try:
+            # Reads the file only; nothing in it is executed.
+            proc = subprocess.run(
+                ["git", "config", "--file", str(config), "--list", "--name-only"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10, env=_git_env())
+        except (OSError, subprocess.SubprocessError):
+            return "cannot read .git/config"
+        if proc.returncode != 0:
+            return "cannot parse .git/config"
+        for key in proc.stdout.splitlines():
+            key = key.strip().lower()
+            if key and key not in _SAFE_CONFIG_KEYS and not key.startswith("branch."):
+                return f".git/config contains the unsupported setting '{key}'"
+    return None
+
+
+def _git(*args: str, timeout: int = 60, raw: bool = False) -> tuple[int, str]:
+    """Run git in WORKSPACE. Returns (exit_code, combined output).
+
+    With raw=True returns stdout unmodified (for NUL-separated output).
+    """
+    problem = _repo_problem()
+    if problem:
+        return 126, f"unsafe .git directory: {problem}"
+    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+           "-c", "commit.gpgsign=false", *args]
+    try:
+        proc = subprocess.run(cmd, cwd=WORKSPACE.resolve(), env=_git_env(), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except FileNotFoundError:
+        return 127, "git is not installed"
+    except subprocess.TimeoutExpired:
+        return 124, "git command timed out"
+    if raw:
+        return proc.returncode, proc.stdout
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def _is_repo() -> bool:
+    code, out = _git("rev-parse", "--show-toplevel")
+    return code == 0 and Path(out).resolve() == WORKSPACE.resolve()
+
+
+def _has_head() -> bool:
+    return _git("rev-parse", "--verify", "HEAD")[0] == 0
+
+
+_NOT_A_REPO = "ERROR: the workspace is not a git repository. Call git_init first."
+
+
+def _require_repo() -> str | None:
+    """Error text if git tools must not run, else None."""
+    problem = _repo_problem()
+    if problem:
+        return (f"ERROR: refusing to use the .git directory: {problem}. "
+                f"It was not created by git_init; ask the user to delete it.")
+    return None if _is_repo() else _NOT_A_REPO
+
+
+@tool
+@_safe_tool
+def git_init() -> str:
+    """Initialise a git repository in the workspace (adds a .gitignore for agent state)."""
+    problem = _repo_problem()
+    if problem:
+        return f"ERROR: refusing to use the existing .git directory: {problem}."
+    if _is_repo():
+        return "Repository already initialised."
+    code, out = _git("init")
+    if code != 0:
+        return f"ERROR: {out}"
+    gitignore = WORKSPACE / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(".agent/\n__pycache__/\n*.pyc\n.pytest_cache/\n", encoding="utf-8")
+    return out or "Initialised repository."
+
+
+@tool
+@_safe_tool
+def git_status() -> str:
+    """Show `git status` for the workspace repository."""
+    error = _require_repo()
+    if error:
+        return error
+    code, out = _git("status", "--short", "--branch")
+    return out if code == 0 else f"ERROR: {out}"
+
+
+@tool
+@_safe_tool
+def git_add(path: str = ".") -> str:
+    """Stage `path` (default: everything) for commit."""
+    error = _require_repo()
+    if error:
+        return error
+    target = safe_path(path)
+    if any(is_git_name(part) for part in Path(_rel(target)).parts):
+        return "ERROR: cannot add .git"
+    code, out = _git("add", "--", _rel(target))
+    return (out or f"Staged {_rel(target)}") if code == 0 else f"ERROR: {out}"
+
+
+@tool
+@_safe_tool
+def git_commit(message: str) -> str:
+    """Commit staged changes with `message`. A local git identity is configured if missing.
+    Requires human approval."""
+    message = (message or "").strip()
+    if not message:
+        return "ERROR: commit message must not be empty"
+    if len(message) > 5000:
+        return "ERROR: commit message too long"
+    error = _require_repo()
+    if error:
+        return error
+    if not _git("config", "user.name")[1]:
+        _git("config", "--local", "user.name", "Coding Agent")
+    if not _git("config", "user.email")[1]:
+        _git("config", "--local", "user.email", "coding-agent@localhost")
+    code, out = _git("commit", "-m", message)
+    if code != 0:
+        if "nothing to commit" in out or "no changes added" in out:
+            return "ERROR: nothing to commit. Stage changes with git_add first."
+        return f"ERROR: {out}"
+    return out
+
+
+def _diff_text() -> str:
+    args = ["diff", "HEAD"] if _has_head() else ["diff"]
+    return _git(*args)[1]
+
+
+@tool
+@_safe_tool
+def git_diff() -> str:
+    """Show uncommitted changes (staged and unstaged) in the workspace repository."""
+    error = _require_repo()
+    if error:
+        return error
+    return _truncate(_diff_text()) or "(no changes)"
+
+
+@tool
+@_safe_tool
+def git_log() -> str:
+    """Show the last 20 commits (one line each)."""
+    error = _require_repo()
+    if error:
+        return error
+    if not _has_head():
+        return "No commits yet."
+    code, out = _git("log", "--oneline", "-n", "20")
+    return out if code == 0 else f"ERROR: {out}"
+
+
+# ---------------------------------------------------------------------------
+# Planning and memory tools (all live in workspace/.agent)
+# ---------------------------------------------------------------------------
+def _agent_file(name: str) -> Path:
+    ensure_workspace()
+    return WORKSPACE / ".agent" / name
+
+
+@tool
+@_safe_tool
+def update_plan(plan_markdown: str) -> str:
+    """Overwrite .agent/PLAN.md with the current plan (Markdown)."""
+    if not plan_markdown.strip():
+        return "ERROR: plan must not be empty"
+    _agent_file("PLAN.md").write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
+    return f"Plan updated ({len(plan_markdown)} characters)."
+
+
+@tool
+@_safe_tool
+def update_todo(todo_markdown: str) -> str:
+    """Overwrite .agent/TODO.md with the current todo checklist (Markdown, '- [ ] item')."""
+    if not todo_markdown.strip():
+        return "ERROR: todo list must not be empty"
+    _agent_file("TODO.md").write_text(todo_markdown.rstrip() + "\n", encoding="utf-8")
+    return f"Todo list updated ({len(todo_markdown)} characters)."
+
+
+@tool
+@_safe_tool
+def save_memory(note: str) -> str:
+    """Append a timestamped note to the persistent memory .agent/MEMORY.md."""
+    note = note.strip()
+    if not note:
+        return "ERROR: note must not be empty"
+    memory = _agent_file("MEMORY.md")
+    if not memory.exists():
+        memory.write_text("# Agent memory\n\n", encoding="utf-8")
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with memory.open("a", encoding="utf-8") as fh:
+        fh.write(f"- [{stamp}] {note}\n")
+    return "Memory saved."
+
+
+@tool
+@_safe_tool
+def read_agent_state() -> str:
+    """Read the saved plan, todo list and memory (.agent/PLAN.md, TODO.md, MEMORY.md)."""
+    sections = []
+    for name in ("PLAN.md", "TODO.md", "MEMORY.md"):
+        file = _agent_file(name)
+        body = file.read_text(encoding="utf-8", errors="replace").strip() if file.exists() else ""
+        sections.append(f"## {name}\n{body or '(empty)'}")
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Review tool
+# ---------------------------------------------------------------------------
+# The verdict must be the whole line (markdown bold/quote/period around it is tolerated).
+# 'VERDICT: APPROVE_WITH_NITS', 'APPROVE-ish', 'Approved with concerns' or 'APPROVE (but ...)'
+# do NOT count as APPROVE: they fail closed.
+_VERDICT_RE = re.compile(
+    r"^[ \t>*_`#-]*VERDICT:[ \t]*\**[ \t]*(APPROVE|REQUEST_CHANGES|NO_CHANGES)[ \t*_`.]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_TREE_RE = re.compile(r"^REVIEWED-TREE:[ \t]*([0-9a-f]{64})[ \t]*$", re.MULTILINE)
+
+REVIEW_CHUNK_CHARS = 50_000  # diff characters per reviewer call
+MAX_REVIEW_CHUNKS = 8        # beyond this the change is too large to review: request changes
+
+
+def parse_verdict(text: str) -> str:
+    """Return the LAST verdict in `text`. A missing verdict fails closed (REQUEST_CHANGES)."""
+    found = _VERDICT_RE.findall(text or "")
+    return found[-1].upper() if found else "REQUEST_CHANGES"
+
+
+def parse_reviewed_tree(text: str) -> str:
+    """Return the LAST 'REVIEWED-TREE: <sha256>' fingerprint in a review ('' if absent)."""
+    found = _TREE_RE.findall(text or "")
+    return found[-1] if found else ""
+
+
+def tree_fingerprint() -> str:
+    """SHA-256 over the content of every non-ignored file in the workspace (index-independent).
+
+    The reviewer approves a specific tree; the pipeline refuses to commit any other one.
+    `.agent/` is excluded because the agent legitimately updates its notes at any time.
+    """
+    code, listing = _git("ls-files", "-z", "--cached", "--others", "--exclude-standard", raw=True)
+    if code != 0:
+        return ""
+    root = WORKSPACE.resolve()
+    digest = hashlib.sha256()
+    for name in sorted({n for n in listing.split("\0") if n}):
+        if name == ".agent" or name.startswith(".agent/"):
+            continue
+        path = root / name
+        if path.is_symlink():
+            marker = b"link:" + os.readlink(path).encode("utf-8", "surrogateescape")
+        elif _is_regular_file(path):
+            inner = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    inner.update(block)
+            marker = b"file:" + inner.digest()
+        else:
+            marker = b"absent"  # deleted tracked file (or something that is not a file)
+        digest.update(name.encode("utf-8", "surrogateescape") + b"\0" + marker + b"\0")
+    return digest.hexdigest()
+
+
+def _split_chunks(text: str, limit: int) -> list[str]:
+    """Split text into pieces of at most `limit` characters, preferring line boundaries."""
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:  # a single enormous line
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + len(line) > limit:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+@tool
+@_safe_tool
+def review_changes() -> str:
+    """Review uncommitted changes: sends `git status` and the COMPLETE `git diff` (in parts if it
+    is large) to the chat model, saves the review to .agent/reviews/review_<timestamp>.md and
+    returns it. The output contains a 'VERDICT:' line and a 'REVIEWED-TREE:' fingerprint of exactly
+    what was reviewed; only that tree can be committed."""
+    error = _require_repo()
+    if error:
+        return error
+    # Make brand-new files show up in `git diff` without staging their content.
+    _git("add", "--intent-to-add", "-A")
+    fingerprint = tree_fingerprint()
+    status = _truncate(_git("status", "--short")[1], 5_000)
+    diff = _diff_text()
+    if not status.strip() and not diff.strip():
+        return "No changes to review.\nVERDICT: NO_CHANGES"
+    if not fingerprint:
+        return "ERROR: could not fingerprint the workspace tree"
+
+    parts = _split_chunks(diff, REVIEW_CHUNK_CHARS) or [""]
+    if len(parts) > MAX_REVIEW_CHUNKS:
+        review = (f"The change is too large to review in full ({len(diff)} characters of diff, "
+                  f"limit {MAX_REVIEW_CHUNKS * REVIEW_CHUNK_CHARS}).\n"
+                  f"- [blocker] Split the work into smaller changes.\n\nVERDICT: REQUEST_CHANGES")
+    else:
+        model = get_chat_model()
+        outputs: list[str] = []
+        for number, part in enumerate(parts, 1):
+            header = f"(part {number} of {len(parts)} of the diff)\n" if len(parts) > 1 else ""
+            request = f"## git status\n{status}\n\n{header}## git diff\n{part}"
+            try:
+                reply = model.invoke(
+                    [SystemMessage(content=REVIEW_PROMPT), HumanMessage(content=request)])
+            except Exception as exc:  # network/API problems must not crash the graph
+                return f"ERROR: review model call failed: {type(exc).__name__}: {exc}"
+            outputs.append(content_to_text(reply.content).strip() or "(empty review)")
+        if len(outputs) == 1:
+            review = outputs[0]
+            if not _VERDICT_RE.search(review):
+                review += "\n\nVERDICT: REQUEST_CHANGES"  # no verdict given: fail closed
+        else:
+            verdicts = [parse_verdict(o) for o in outputs]
+            body = "\n\n".join(f"### Part {i}\n{_VERDICT_RE.sub('', o).strip()}"
+                                for i, o in enumerate(outputs, 1))
+            overall = "APPROVE" if all(v == "APPROVE" for v in verdicts) else "REQUEST_CHANGES"
+            review = f"{body}\n\nVERDICT: {overall}"
+    # Appended by this tool, after the model's text, so model output cannot forge it.
+    review += f"\n\nREVIEWED-TREE: {fingerprint}"
+
+    reviews_dir = ensure_workspace() / ".agent" / "reviews"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = reviews_dir / f"review_{stamp}.md"
+    counter = 1
+    while out.exists():
+        counter += 1
+        out = reviews_dir / f"review_{stamp}_{counter}.md"
+    out.write_text(review + "\n", encoding="utf-8")
+    return review
+
+
+# ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
+TOOLS = [
+    # file tools
+    list_files, read_file, write_file, edit_file, create_directory, search_text,
+    # execution tools
+    run_python_file, check_python_syntax, run_tests, install_packages,
+    # git tools
+    git_init, git_status, git_add, git_commit, git_diff, git_log,
+    # planning and memory tools
+    update_plan, update_todo, save_memory, read_agent_state,
+    # review tool
+    review_changes,
+]
+TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+
+# ---------------------------------------------------------------------------
+# Approval policy: only dangerous tools need a human
+# ---------------------------------------------------------------------------
+# Dangerous = changes project files, executes code, installs software or records history.
+DANGEROUS_TOOLS = frozenset({
+    "write_file", "edit_file", "create_directory",
+    "run_python_file", "run_tests", "install_packages",
+    "git_commit",
+})
+# Safe = reads, listings, parsing, staging, and the agent's own notes in .agent/.
+SAFE_TOOLS = frozenset({
+    "list_files", "read_file", "search_text", "check_python_syntax",
+    "git_init", "git_status", "git_add", "git_diff", "git_log",
+    "update_plan", "update_todo", "save_memory", "read_agent_state", "review_changes",
+})
+assert DANGEROUS_TOOLS | SAFE_TOOLS == set(TOOLS_BY_NAME), "every tool must be classified"
+assert not DANGEROUS_TOOLS & SAFE_TOOLS
+
+
+def approval_mode() -> str:
+    """'dangerous' (default): only dangerous tools need approval. 'all': every tool does."""
+    mode = os.getenv("APPROVAL_MODE", "dangerous").strip().lower()
+    return mode if mode in ("dangerous", "all") else "dangerous"
+
+
+def requires_approval(tool_name: str) -> bool:
+    """True if a call to `tool_name` must be approved by a human.
+    Unknown tools always require approval (fail closed)."""
+    if approval_mode() == "all":
+        return True
+    return tool_name not in SAFE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# Per-stage allow-lists for the planner -> coder -> reviewer -> committer pipeline
+# ---------------------------------------------------------------------------
+STAGES = ("planner", "coder", "reviewer", "committer")
+
+STAGE_TOOLS: dict[str, tuple[str, ...]] = {
+    # Understand and plan; cannot touch project files or run code.
+    "planner": ("read_agent_state", "list_files", "read_file", "search_text",
+                "git_status", "git_log", "update_plan", "update_todo"),
+    # The only stage that can change files, run code or install packages. Cannot review or commit.
+    "coder": ("read_agent_state", "list_files", "read_file", "search_text",
+              "write_file", "edit_file", "create_directory", "check_python_syntax",
+              "run_python_file", "run_tests", "install_packages", "update_todo",
+              "git_status", "git_diff", "save_memory"),
+    # Read-only judge: no write/edit tools at all.
+    # git_init is allowed only so review_changes can work on a brand-new workspace.
+    "reviewer": ("read_agent_state", "list_files", "read_file", "search_text",
+                 "check_python_syntax", "run_tests", "git_init", "git_status", "git_diff",
+                 "git_log", "review_changes"),
+    # The only stage that can stage and commit.
+    "committer": ("read_agent_state", "git_init", "git_status", "git_diff", "git_log",
+                  "git_add", "git_commit", "save_memory"),
+}
+for _stage, _names in STAGE_TOOLS.items():
+    assert set(_names) <= set(TOOLS_BY_NAME), f"unknown tool in {_stage}"
+assert "git_commit" not in sum((STAGE_TOOLS[s] for s in ("planner", "coder", "reviewer")), ())
+
+
+def workspace_top_level(limit: int = 50) -> list[tuple[str, bool]]:
+    """Top-level workspace entries as (name, is_dir), directories first (for the UI sidebar)."""
+    ensure_workspace()
+    items = [(p.name, p.is_dir()) for p in WORKSPACE.iterdir() if p.name not in IGNORED_DIRS]
+    items.sort(key=lambda item: (not item[1], item[0].lower()))
+    return items[:limit]
