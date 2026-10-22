@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# The agent's working directory holds generated projects, plans and memory.
+# Keep the directory itself, not its contents.
+workspace/*
+!workspace/.gitkeep
