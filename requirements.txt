@@ -1,0 +1,8 @@
+streamlit
+python-dotenv
+langgraph
+langchain
+langchain-openai
+langchain-google-genai
+# Optional: xAI / Grok support (set LLM_PROVIDER=xai)
+# langchain-xai
