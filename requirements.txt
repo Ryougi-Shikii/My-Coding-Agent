@@ -1,6 +1,7 @@
 streamlit
 python-dotenv
 langgraph
+langgraph-checkpoint-sqlite
 langchain
 langchain-openai
 langchain-anthropic

@@ -11,3 +11,7 @@ venv/
 # The agent's working directory holds generated projects, plans and memory.
 # Keep the directory itself, not its contents.
 workspace/*
+!workspace/.gitkeep
+
+# Saved conversations
+.data/

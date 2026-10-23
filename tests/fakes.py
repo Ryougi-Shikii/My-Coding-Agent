@@ -25,7 +25,7 @@ def ai(text: str = "", *calls: dict) -> AIMessage:
 def stage_key(messages) -> str:
     """Which role is asking? Decided from the system prompt (first message)."""
     system = str(messages[0].content)
-    for stage in ("PLANNER", "CODER", "REVIEWER", "COMMITTER"):
+    for stage in ("CHAT", "PLANNER", "CODER", "REVIEWER", "COMMITTER"):
         if f"ROLE: {stage}" in system:
             return stage.lower()
     if "strict senior code reviewer" in system:

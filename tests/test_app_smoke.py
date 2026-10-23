@@ -107,6 +107,7 @@ class FakeStreamlit:
 @pytest.fixture
 def app(fake_llm, ws, monkeypatch):
     fake = FakeStreamlit()
+    fake.session_state.mode = "pipeline"  # these flows are the strict pipeline; auto has its own tests
     monkeypatch.setitem(sys.modules, "streamlit", fake)
 
     def run_script(max_runs: int = 12) -> None:
@@ -261,3 +262,108 @@ def test_app_source_uses_the_required_session_state_and_widgets():
                    "workspace_top_level", "New conversation", "Approve", "Reject",
                    "reject_tool_calls", "pending_tool_calls", "st.chat_input"):
         assert needle in source, needle
+
+
+# ------------------------------------------------------------------------------ auto mode + history
+def _label(app, prefix):
+    matches = [b for b in app.buttons() if b.startswith(prefix)]
+    assert matches, (prefix, app.buttons())
+    return matches[0]
+
+
+def test_auto_mode_greeting_has_no_approval(app, ws):
+    app.session_state.mode = "auto"
+    app.install_model({"chat": ["Hey! What shall we build?"]})
+    app.run()
+    app.next_prompt = "hi"
+    app.run()
+    assert not {"✅ Approve", "⛔ Reject"} & set(app.buttons())
+    assert ("chat_input", False) in app.log
+    assert [m["node"] for m in app.session_state.messages if m["kind"] == "ai"] == ["chat"]
+    assert not (ws / "hello.py").exists()
+
+
+def test_conversation_is_listed_and_can_be_reopened_after_new_conversation(app, ws):
+    app.session_state.mode = "auto"
+    app.install_model({"chat": ["Teal is nice.", "Cats are great."]})
+    app.run()
+    app.next_prompt = "my favourite colour is teal"
+    app.run()
+    first = app.session_state.thread_id
+    app.pressed = {"New conversation"}
+    app.run()
+    assert app.session_state.thread_id != first and app.session_state.messages == []
+    app.next_prompt = "tell me about cats"
+    app.run()
+    labels = app.buttons()
+    assert any(b.startswith("● tell me about cats") for b in labels)
+    assert any(b.startswith("my favourite colour is teal") for b in labels)
+    app.pressed = {_label(app, "my favourite colour is teal")}
+    app.run()
+    assert app.session_state.thread_id == first
+    shown = [(m["kind"], m["content"]) for m in app.session_state.messages]
+    assert ("user", "my favourite colour is teal") in shown and ("ai", "Teal is nice.") in shown
+
+
+def test_continue_last_conversation_after_the_app_restarts(app, ws):
+    app.session_state.mode = "auto"
+    app.install_model({"chat": ["noted"]})
+    app.run()
+    app.next_prompt = "remember this"
+    app.run()
+    # a browser refresh: new Streamlit session, same saved database
+    app.session_state.clear()
+    app.session_state.mode = "auto"
+    g._graphs.clear()
+    app.run()
+    assert "▶ Continue last conversation" in app.buttons() and app.session_state.messages == []
+    app.pressed = {"▶ Continue last conversation"}
+    app.run()
+    assert [m["content"] for m in app.session_state.messages if m["kind"] == "user"] == ["remember this"]
+    assert "▶ Continue last conversation" not in app.buttons()
+
+
+def test_pending_approval_survives_reopening_and_locks_the_sidebar(app, ws):
+    app.session_state.mode = "auto"
+    app.install_model({"chat": [ai("", call("run_tests")), "ok"]})
+    app.run()
+    app.next_prompt = "run the tests"
+    app.run()
+    assert {"✅ Approve", "⛔ Reject"} <= set(app.buttons())
+    app.session_state.clear()
+    app.session_state.mode = "auto"
+    g._graphs.clear()
+    app.run()
+    assert "✅ Approve" not in app.buttons()  # a new, empty conversation
+    app.pressed = {"▶ Continue last conversation"}
+    app.run()
+    assert {"✅ Approve", "⛔ Reject"} <= set(app.buttons())  # the same pending call is back
+    assert ("chat_input", True) in app.log
+
+
+def test_delete_conversation_from_the_sidebar(app, ws):
+    app.session_state.mode = "auto"
+    app.install_model({"chat": ["a"]})
+    app.run()
+    app.next_prompt = "to be deleted"
+    app.run()
+    app.pressed = {_label(app, "🗑")}
+    app.run()
+    assert app.session_state.messages == []  # the open conversation was deleted -> fresh one
+    assert not any(b.startswith("to be deleted") for b in app.buttons())
+
+
+def test_mode_change_keeps_the_conversation(app, ws):
+    app.session_state.mode = "auto"
+    app.install_model({"chat": ["hello"], "react": ["hello again"]})
+    app.run()
+    app.next_prompt = "hi"
+    app.run()
+    thread = app.session_state.thread_id
+    app.session_state.mode_choice = "react"
+    app.session_state.mode = "react"  # what the on_change callback does
+    app.run()
+    app.next_prompt = "still there?"
+    app.run()
+    assert app.session_state.thread_id == thread
+    assert [m["content"] for m in app.session_state.messages if m["kind"] == "ai"][-1] == "hello again"

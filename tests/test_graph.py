@@ -114,7 +114,8 @@ class TestPipelineHappyPath:
         graph, config = new_graph(model)
         run_to_end(graph, config, "first question")
         assert status_of(graph, config) == {"stage": "done", "status": "no_changes",
-                                            "revisions": 0, "waiting": False}
+                                            "revisions": 0, "waiting": False,
+                                            "steps": ["planner", "coder", "reviewer", "committer"]}
         events, _ = run_to_end(graph, config, "second question")
         assert model.roles().count("planner") == 6  # 3 planner calls per run
         assert stage_order(events)[0] == "planner"
@@ -490,11 +491,13 @@ class TestBuilders:
 
     def test_default_mode_from_env(self, monkeypatch):
         monkeypatch.delenv("AGENT_MODE", raising=False)
-        assert g.default_mode() == "pipeline"
+        assert g.default_mode() == "auto"
         monkeypatch.setenv("AGENT_MODE", "REACT")
         assert g.default_mode() == "react"
-        monkeypatch.setenv("AGENT_MODE", "nonsense")
+        monkeypatch.setenv("AGENT_MODE", "pipeline")
         assert g.default_mode() == "pipeline"
+        monkeypatch.setenv("AGENT_MODE", "nonsense")
+        assert g.default_mode() == "auto"
 
     def test_graph_uses_required_building_blocks(self):
         import inspect
@@ -502,7 +505,10 @@ class TestBuilders:
         from agent import llm
         assert "from langchain.chat_models import init_chat_model" in inspect.getsource(llm)
         assert "from langgraph.prebuilt import create_react_agent" in inspect.getsource(g)
-        assert "MemorySaver" in inspect.getsource(g) and 'interrupt_before=["tools"]' in inspect.getsource(g)
+        from agent import history
+        assert "history.get_checkpointer" in inspect.getsource(g)
+        assert "MemorySaver" in inspect.getsource(history) and "SqliteSaver" in inspect.getsource(history)
+        assert 'interrupt_before=["tools"]' in inspect.getsource(g)
 
     def test_threads_are_isolated(self, fake_llm, ws):
         script = {"planner": planner_steps() * 2, "coder": ["a1", "a2"]}

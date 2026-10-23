@@ -8,9 +8,22 @@ from pathlib import Path
 import pytest
 
 from agent import graph as graph_module
+from agent import history
 from agent import sandbox
 from agent import tools as tools_module
 from tests.fakes import ScriptedChatModel
+
+
+@pytest.fixture(autouse=True)
+def isolated_history(tmp_path, monkeypatch):
+    """Every test gets its own conversation database: tests never touch real saved chats."""
+    monkeypatch.setenv("CONVERSATION_DB", str(tmp_path / "conversations.sqlite"))
+    monkeypatch.delenv("AGENT_MODE", raising=False)
+    history.reset()
+    graph_module._graphs.clear()
+    yield
+    history.reset()
+    graph_module._graphs.clear()
 
 
 @pytest.fixture

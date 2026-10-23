@@ -1,0 +1,38 @@
+# Base sandbox image with Python 3.12 slim
+FROM python:3.12-slim
+
+# Prevent pip from writing cache files to keep image size small
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install common libraries ahead of time so the agent never needs slow docker builds
+RUN pip install \
+    pytest \
+    pytest-cov \
+    requests \
+    httpx \
+    pydantic \
+    fastapi \
+    numpy \
+    pandas \
+    matplotlib \
+    beautifulsoup4
+
+# ==============================================================================
+# HOW TO BUILD AND USE THIS SANDBOX IMAGE:
+# ==============================================================================
+#
+# Step 2: Build the image with Docker
+#   Open PowerShell/terminal in this project root and run:
+#     docker build -f Dockerfile.sandbox -t my-coding-sandbox:latest .
+#
+# Step 3: Tell the agent to use your new image
+#   Open your .env file and set:
+#     SANDBOX_IMAGE=my-coding-sandbox:latest
+#
+# Step 4: Verify it in the app
+#   Run the app:
+#     streamlit run app.py
+#   Check the left sidebar under "Sandbox":
+#     It should show "Image: my-coding-sandbox:latest" and "Docker available".
+# ==============================================================================

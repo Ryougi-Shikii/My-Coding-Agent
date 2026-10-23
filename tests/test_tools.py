@@ -302,7 +302,8 @@ class TestApprovalPolicy:
 
     def test_stage_allow_lists(self):
         everything = set(t.TOOLS_BY_NAME)
-        assert set(t.STAGE_TOOLS) == set(t.STAGES) == {"planner", "coder", "reviewer", "committer"}
+        assert set(t.STAGES) == {"planner", "coder", "reviewer", "committer"}
+        assert set(t.STAGE_TOOLS) == set(t.STAGES) | {"chat"}
         mutating = {"write_file", "edit_file", "create_directory", "install_packages"}
         assert not mutating & set(t.STAGE_TOOLS["planner"])
         assert not mutating & set(t.STAGE_TOOLS["reviewer"])

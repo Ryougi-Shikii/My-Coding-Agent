@@ -37,7 +37,8 @@ class Terminal:
 
 
 def run(term: Terminal, *argv: str) -> int:
-    return cli.run_cli(list(argv), input_fn=term.input, output_fn=term.out)
+    args = list(argv) if "--mode" in argv else ["--mode", "pipeline", *argv]
+    return cli.run_cli(args, input_fn=term.input, output_fn=term.out)
 
 
 def test_full_pipeline_conversation_with_two_approvals(fake_llm, ws):

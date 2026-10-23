@@ -10,16 +10,42 @@ It works with several LLM providers (OpenAI, Anthropic, Google Gemini, xAI/Grok)
 
 The agent only ever works inside the `workspace/` directory.
 
-## Two modes
+## Three modes
 
-| | `pipeline` (default) | `react` |
-|---|---|---|
-| Structure | Four LangGraph nodes: **planner → coder → reviewer → committer** | One `create_react_agent` loop |
-| Order of work | Enforced by the graph | Encouraged by the system prompt |
-| Review before commit | Enforced (cannot commit without an `APPROVE` verdict) | Prompt only |
+| | `auto` (default) | `pipeline` (strict) | `react` |
+|---|---|---|---|
+| Feels like | A coding assistant: chat, discuss, brainstorm, explore, build | A fixed build line | One classic agent loop |
+| "hi" | Just replies, no tools, no approval | Starts planning | Replies |
+| Structure | Chat node + build stages on demand | **planner → coder → reviewer → committer**, always | One `create_react_agent` loop |
+| Reading / exploring | Chat reads files and runs `git status` etc. on its own | Per stage | Yes |
+| Writing code | Only by handing off to a build (`start_build`) | Always through the stages | Directly (with approval) |
+| Review before commit | Enforced (a commit needs an `APPROVE` of the exact tree) | Enforced | Prompt only |
 
-Choose with `AGENT_MODE` in `.env`, `python cli.py --mode react`, or the mode selector in the
-Streamlit sidebar.
+**How `auto` works.** The agent chats like an assistant. When you ask for real work it calls `start_build(task, steps)`
+and chooses only the steps that make sense: `plan`, `code`, `review`, `commit` (always run in that order). A one-line fix
+can be just `code`; "commit what I have" can be `review` + `commit`; nothing is committed unless you asked for it (`commit`
+requires `review`). When the build ends, control returns to the chat, which tells you honestly what was done and what was
+not. All the hard rules below still apply inside a build; the chat itself can read and run things (running still asks you)
+but cannot write files or commit.
+
+Choose with `AGENT_MODE` in `.env`, `python cli.py --mode react`, `/mode` in the CLI, or the sidebar selector.
+You can switch modes in the middle of a conversation; the messages carry over.
+
+## Conversations are saved
+
+Conversations (messages, plan state, even a pending approval) are stored in a SQLite file
+(`.data/conversations.sqlite`, change it with `CONVERSATION_DB`; `CONVERSATION_DB=memory` turns saving off), so closing
+the terminal or the browser does not lose them. They are grouped by workspace.
+
+```bash
+python cli.py --continue     # pick up the most recent conversation
+python cli.py --resume 2     # a specific one (number from --list, or an id prefix)
+python cli.py --list         # list them
+```
+
+In the CLI: `/list`, `/resume [n|id]`, `/delete n|id`, `/new`, `/mode [auto|react|pipeline]`.
+In the web app: the sidebar lists conversations to open or delete, with **Continue last conversation** for a fresh session.
+Resuming shows the end of the conversation again; if it was waiting for an approval, you are asked again.
 
 ### Approval: only dangerous tools need a human
 
@@ -31,11 +57,13 @@ Streamlit sidebar.
   the agent its call was refused (it receives a `ToolMessage` saying so) and it must change approach.
 * Unknown tools always need approval. Set `APPROVAL_MODE=all` to be asked about every tool call.
 * If one batch of tool calls contains both safe and dangerous tools, you approve or reject the batch as a whole.
-* Mechanics: in `pipeline` mode a conditional edge routes only dangerous batches through the
+* Mechanics: in `pipeline` / `auto` mode a conditional edge routes only dangerous batches through the
   single `approval` node, which is the graph's only interrupt. In `react` mode the graph still pauses
   before every `tools` step (`interrupt_before=["tools"]`) and the shared driver resumes safe batches by itself.
 
-### What the pipeline enforces (in code, not in the prompt)
+### What a build enforces (in code, not in the prompt)
+
+(Applies to the strict `pipeline` mode and to every build started from `auto`; `auto` just lets the chat choose which of the stages run.)
 
 * **Per-stage tools.** Each node only gets its own tools, and the shared tools node checks again, so a call the model
   should not make is answered with an error instead of running:
@@ -93,13 +121,14 @@ docker pull python:3.12-slim
 
 ```bash
 streamlit run app.py        # web app
-python cli.py               # terminal version
+python cli.py               # terminal version (auto mode)
+python cli.py --continue    # continue the last conversation
 python cli.py --mode react  # classic single-agent mode
 ```
 
 The web sidebar shows whether Docker is available, the current sandbox image, the pipeline stage, and the top-level
 files in the workspace. **New conversation** starts a fresh LangGraph thread.
-In the CLI, type `/help` for commands (`/state`, `/status`, `/new`, `/exit`).
+In the CLI, type `/help` for commands (`/state`, `/status`, `/new`, `/list`, `/resume`, `/delete`, `/mode`, `/exit`).
 
 ## Safety model
 
@@ -128,7 +157,7 @@ In the CLI, type `/help` for commands (`/state`, `/status`, `/new`, `/exit`).
 
 The agent keeps its notes in `workspace/.agent/`: `PLAN.md`, `TODO.md`, `MEMORY.md` (timestamped notes), `reviews/review_<timestamp>.md`,
 and `sandbox_image.txt`. This folder is excluded from the workspace's own Git repository (`git_init` writes a `.gitignore` for it).
-Conversation history lives in memory only and is lost when the process restarts; the files in `.agent/` persist.
+Conversation history is stored separately (see *Conversations are saved*); the files in `.agent/` persist too.
 
 ## Project layout
 
@@ -139,7 +168,8 @@ agent/llm.py      get_chat_model(): init_chat_model, provider/model from env, ca
 agent/prompts.py  system prompt and per-stage prompts
 agent/sandbox.py  Docker execution and image building
 agent/tools.py    workspace-confined tools, approval policy, per-stage tool lists
-agent/graph.py    react graph, pipeline graph, shared run/approval driver
+agent/graph.py    react / pipeline / auto graphs, shared run/approval driver
+agent/history.py  saved conversations (SQLite checkpointer + index)
 workspace/        the only directory the agent should modify
 tests/            pytest suite (no API key or Docker needed)
 ```
