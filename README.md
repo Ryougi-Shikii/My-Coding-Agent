@@ -73,7 +73,7 @@ cp .env.example .env        # then edit .env
 
 ```
 LLM_PROVIDER=google_genai        # openai | anthropic | google_genai | xai
-MODEL_NAME=gemini-3.5-flash-lite      # optional: each provider has a default
+MODEL_NAME=gemini-2.0-flash      # optional: each provider has a default
 GOOGLE_API_KEY=...               # the key for the provider you chose
 ```
 

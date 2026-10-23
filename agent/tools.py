@@ -735,6 +735,49 @@ def review_changes() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Build handoff (chat stage only; intercepted by the graph, never executed as a normal tool)
+# ---------------------------------------------------------------------------
+STEP_TO_STAGE = {"plan": "planner", "code": "coder", "review": "reviewer", "commit": "committer"}
+DEFAULT_BUILD_STEPS = ("plan", "code", "review")
+
+
+def normalize_build_steps(steps) -> list[str]:
+    """Validate the steps chosen for a build and return stage names in pipeline order.
+
+    The ORDER is fixed (planner, coder, reviewer, committer); the caller only chooses which
+    steps run. Rules: a build needs 'code' or 'review', and 'commit' requires 'review', so
+    nothing can be committed without a review of exactly what is committed.
+    """
+    if steps is None or (not isinstance(steps, str) and len(steps) == 0):
+        steps = DEFAULT_BUILD_STEPS
+    if isinstance(steps, str):
+        steps = [part for part in re.split(r"[\s,>/+-]+", steps) if part]
+    chosen: set[str] = set()
+    for raw in steps:
+        key = str(raw).strip().lower()
+        stage = STEP_TO_STAGE.get(key) or (key if key in STEP_TO_STAGE.values() else None)
+        if stage is None:
+            raise ValueError(f"unknown step '{raw}'. Valid steps: plan, code, review, commit")
+        chosen.add(stage)
+    if not chosen & {"coder", "reviewer"}:
+        raise ValueError("a build needs at least 'code' or 'review'")
+    if "committer" in chosen and "reviewer" not in chosen:
+        raise ValueError("'commit' requires 'review': only reviewed changes can be committed")
+    return [stage for stage in ("planner", "coder", "reviewer", "committer") if stage in chosen]
+
+
+@tool
+def start_build(task: str, steps: list[str] | None = None) -> str:
+    """Hand a concrete coding task to the build pipeline (the only way to change project files).
+    `task`: a complete, self-contained description of what to build or change.
+    `steps`: which steps to run, any of 'plan', 'code', 'review', 'commit' (they always run in
+    that order). Default ['plan','code','review']. Use ['code'] for a tiny edit; add 'commit' only
+    when the user wants it committed ('commit' needs 'review'). Use ['review','commit'] to review
+    and commit changes that already exist. Call it alone, never together with other tools."""
+    return "ERROR: start_build only works from the chat stage of the auto agent."
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 TOOLS = [
@@ -749,7 +792,9 @@ TOOLS = [
     # review tool
     review_changes,
 ]
-TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+# TOOLS is what the classic react agent gets. start_build exists only in the auto agent.
+ALL_TOOLS = [*TOOLS, start_build]
+TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
 
 # ---------------------------------------------------------------------------
 # Approval policy: only dangerous tools need a human
@@ -765,6 +810,7 @@ SAFE_TOOLS = frozenset({
     "list_files", "read_file", "search_text", "check_python_syntax",
     "git_init", "git_status", "git_add", "git_diff", "git_log",
     "update_plan", "update_todo", "save_memory", "read_agent_state", "review_changes",
+    "start_build",  # a handoff only: it starts the build stages, whose dangerous tools still ask
 })
 assert DANGEROUS_TOOLS | SAFE_TOOLS == set(TOOLS_BY_NAME), "every tool must be classified"
 assert not DANGEROUS_TOOLS & SAFE_TOOLS
@@ -788,8 +834,14 @@ def requires_approval(tool_name: str) -> bool:
 # Per-stage allow-lists for the planner -> coder -> reviewer -> committer pipeline
 # ---------------------------------------------------------------------------
 STAGES = ("planner", "coder", "reviewer", "committer")
+CHAT_STAGE = "chat"
 
 STAGE_TOOLS: dict[str, tuple[str, ...]] = {
+    # Conversation: can look at everything, run code/tests (with approval) and keep notes, but
+    # cannot change project files or commit. Changes go through start_build.
+    "chat": ("read_agent_state", "list_files", "read_file", "search_text", "check_python_syntax",
+             "run_python_file", "run_tests", "git_status", "git_diff", "git_log",
+             "update_plan", "update_todo", "save_memory", "start_build"),
     # Understand and plan; cannot touch project files or run code.
     "planner": ("read_agent_state", "list_files", "read_file", "search_text",
                 "git_status", "git_log", "update_plan", "update_todo"),
@@ -809,7 +861,8 @@ STAGE_TOOLS: dict[str, tuple[str, ...]] = {
 }
 for _stage, _names in STAGE_TOOLS.items():
     assert set(_names) <= set(TOOLS_BY_NAME), f"unknown tool in {_stage}"
-assert "git_commit" not in sum((STAGE_TOOLS[s] for s in ("planner", "coder", "reviewer")), ())
+assert "git_commit" not in sum((STAGE_TOOLS[s] for s in ("chat", "planner", "coder", "reviewer")), ())
+assert not {"write_file", "edit_file", "create_directory", "install_packages", "git_add"} & set(STAGE_TOOLS["chat"])
 
 
 def workspace_top_level(limit: int = 50) -> list[tuple[str, bool]]:

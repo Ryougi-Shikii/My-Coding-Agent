@@ -1,22 +1,32 @@
 """LangGraph graphs and the shared run/approval driver.
 
-Two modes share one tool set and one approval policy:
+Three modes share one tool set and one approval policy:
+
+``auto``      (default) Chat first. A conversational node talks, discusses, brainstorms and can look
+              at the project (read-only tools run without asking). Only when the user wants
+              something built does it call ``start_build(task, steps)``, which hands over to the
+              build pipeline below with just the steps that are needed ("code" for a tiny edit,
+              "plan, code, review" for a feature, plus "commit" only on request). When the build
+              ends, control returns to the chat node, which reports honestly what happened.
+
+``pipeline``  Strict: every message runs planner -> coder -> reviewer -> committer.
 
 ``react``     create_react_agent. The graph pauses before EVERY tool batch
               (interrupt_before=["tools"]); the driver auto-resumes batches that contain only
               safe tools, so humans only see dangerous ones.
 
-``pipeline``  (default) A StateGraph with four hard-enforced nodes:
+Build enforcement is structural, not prompt-based (``auto`` and ``pipeline``):
+  * each node is bound to its own tool set (STAGE_TOOLS) and the shared tools node re-checks the
+    allow-list, so e.g. git_commit outside the committer is refused;
+  * the order is fixed (planner, coder, reviewer, committer); the chat node only chooses WHICH steps
+    run, and a commit always requires a review;
+  * an `advance` gate decides every transition from tool results (plan+todo written, files changed,
+    review_changes verdict, git_commit succeeded), and only the exact tree the reviewer approved can
+    be committed;
+  * a conditional edge sends only dangerous batches through the `approval` node, the single place the
+    graph interrupts. Safe batches never pause.
 
-                  planner -> coder -> reviewer -> committer
-
-              Enforcement is structural, not prompt-based:
-              * each node is bound to its own tool set (STAGE_TOOLS) and the shared tools node
-                re-checks the allow-list, so e.g. git_commit outside the committer is refused;
-              * an `advance` gate decides every transition from tool results (plan+todo written,
-                files changed, review_changes verdict, git_commit succeeded);
-              * a conditional edge sends only dangerous batches through the `approval` node,
-                the single place the graph interrupts. Safe batches never pause.
+Conversations persist (see agent/history.py): the checkpointer is SQLite by default.
 """
 
 from __future__ import annotations
@@ -26,30 +36,47 @@ import warnings
 from typing import Any, Iterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import create_react_agent
 
+from agent import history
 from agent import tools as tools_module
 from agent.llm import content_to_text, get_chat_model
-from agent.prompts import HANDOFF, STAGE_PROMPTS, SYSTEM_PROMPT, render_prompt
+from agent.prompts import (
+    BUILD_START,
+    BUILD_STATUS_DETAIL,
+    CHAT_PROMPT,
+    HANDOFF,
+    STAGE_PROMPTS,
+    SYSTEM_PROMPT,
+    render_prompt,
+)
 from agent.tools import (
+    CHAT_STAGE,
     STAGE_TOOLS,
     STAGES,
     TOOLS,
     TOOLS_BY_NAME,
     is_error_text,
+    normalize_build_steps,
     parse_verdict,
     requires_approval,
 )
 
-MODES = ("pipeline", "react")
-MAX_NUDGES = 3  # how often a stage may be reminded of missing required steps
+MODES = ("auto", "react", "pipeline")
+MAX_NUDGES = 3            # how often a stage may be reminded of missing required steps
+MAX_BUILDS_PER_TURN = 3   # builds the chat node may start for one user message
+
+MODE_HELP = {
+    "auto": "chat first; starts the plan/code/review/commit pipeline only when you want something built",
+    "react": "one agent that can do everything itself (each dangerous tool asks you)",
+    "pipeline": "strict: every message runs planner -> coder -> reviewer -> committer",
+}
 
 
 def default_mode() -> str:
-    mode = os.getenv("AGENT_MODE", "pipeline").strip().lower()
-    return mode if mode in MODES else "pipeline"
+    mode = os.getenv("AGENT_MODE", "auto").strip().lower()
+    return mode if mode in MODES else "auto"
 
 
 def max_review_rounds() -> int:
@@ -59,9 +86,7 @@ def max_review_rounds() -> int:
         return 3
 
 
-# One checkpointer for the whole process; threads are separated by thread_id.
-_checkpointer = MemorySaver()
-_graphs: dict[str, Any] = {}
+_graphs: dict[tuple[str, str], Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -85,14 +110,18 @@ def _build_react_graph(model, checkpointer):
 
 
 # ---------------------------------------------------------------------------
-# pipeline mode
+# auto / pipeline modes
 # ---------------------------------------------------------------------------
 class PipelineState(MessagesState):
-    stage: str        # planner | coder | reviewer | committer | done
-    stage_start: int  # index into messages where the current stage began
-    revisions: int    # how many times the reviewer sent work back to the coder
-    nudges: int       # reminders issued in the current stage
-    status: str       # "" while running; committed | no_changes | stalled | review_failed
+    stage: str          # chat | planner | coder | reviewer | committer | done
+    steps: list         # stage names of the current build, in pipeline order
+    after: str          # where control goes when a build ends: "chat" (auto) or "done" (pipeline)
+    stage_start: int    # index into messages where the current stage began
+    revisions: int      # how many times the reviewer sent work back to the coder
+    nudges: int         # reminders issued in the current stage
+    builds: int         # builds started for the current user message
+    status: str         # "" while running; committed | reviewed | coded | no_changes |
+                        # stalled | review_failed
     reviewed_tree: str  # fingerprint of the exact tree the reviewer approved ("" before approval)
 
 
@@ -122,20 +151,32 @@ def run_tool_call(call: dict) -> ToolMessage:
                        status="error" if is_error_text(text) else "success")
 
 
-def _handoff(next_stage: str) -> HumanMessage:
-    # A user-role message also keeps the transcript valid for providers that reject a
-    # conversation ending on an assistant message.
-    return HumanMessage(content=f"[pipeline] {HANDOFF[next_stage]}")
+def _error_message(call: dict, text: str) -> ToolMessage:
+    return ToolMessage(content="ERROR: " + text, tool_call_id=call["id"], name=call["name"],
+                       status="error")
 
 
 def _go(state: PipelineState, next_stage: str, extra: str = "", **updates) -> dict:
+    """Hand over to `next_stage` (a user-role message also keeps the transcript valid for
+    providers that reject a conversation ending on an assistant message)."""
     text = HANDOFF[next_stage] + (("\n\n" + extra) if extra else "")
     return {"stage": next_stage, "stage_start": len(state["messages"]) + 1, "nudges": 0,
             "messages": [HumanMessage(content=f"[pipeline] {text}")], **updates}
 
 
-def _finish(status: str, note: str = "") -> dict:
-    update: dict = {"stage": "done", "status": status}
+def _conclude(state: PipelineState, status: str, note: str = "", **updates) -> dict:
+    """End the build. In `auto` control returns to the chat node, which is told the outcome so it
+    can report it to the user; in strict `pipeline` mode the run is over."""
+    if state.get("after") == "chat":
+        detail = BUILD_STATUS_DETAIL.get(status, "")
+        extra = (note.strip() + "\n") if note.strip() else ""
+        text = (f"[pipeline] The build finished with status '{status}'. {detail}\n{extra}"
+                "You are back in the conversation: tell the user briefly and honestly what happened "
+                "(what changed, what was verified, what was NOT done) and suggest next steps. Do not "
+                "call start_build again unless the user asks.")
+        return {"stage": CHAT_STAGE, "status": status, "nudges": 0,
+                "messages": [HumanMessage(content=text)], **updates}
+    update: dict = {"stage": "done", "status": status, **updates}
     if note:
         update["messages"] = [AIMessage(content=f"[pipeline] {note}")]
     return update
@@ -144,15 +185,67 @@ def _finish(status: str, note: str = "") -> dict:
 def _nudge(state: PipelineState, text: str) -> dict:
     nudges = state["nudges"] + 1
     if nudges > MAX_NUDGES:
-        return _finish("stalled", f"Stopped: the {state['stage']} stage did not complete its "
-                                  f"required steps. {text}")
+        return _conclude(state, "stalled",
+                         f"Stopped: the {state['stage']} stage did not complete its required "
+                         f"steps. {text}")
     return {"nudges": nudges, "messages": [HumanMessage(content=f"[pipeline] {text}")]}
 
 
-def intake(state: PipelineState) -> dict:
-    """Entry node: every new user message restarts the pipeline at the planner."""
-    return {"stage": "planner", "stage_start": max(len(state["messages"]) - 1, 0),
-            "revisions": 0, "nudges": 0, "status": "", "reviewed_tree": ""}
+def _next_stage(state: PipelineState, stage: str) -> str | None:
+    """The next chosen step after `stage`, or None if the build ends here."""
+    chosen = state.get("steps") or list(STAGES)
+    later = [s for s in STAGES if s in chosen and STAGES.index(s) > STAGES.index(stage)]
+    return later[0] if later else None
+
+
+def make_intake(chat: bool):
+    """Entry node: every new user message starts here."""
+
+    def intake(state: PipelineState) -> dict:
+        update = {"revisions": 0, "nudges": 0, "builds": 0, "status": "", "reviewed_tree": ""}
+        if chat:
+            return {**update, "stage": CHAT_STAGE, "steps": [], "after": "chat"}
+        return {**update, "stage": "planner", "steps": list(STAGES), "after": "done",
+                "stage_start": max(len(state["messages"]) - 1, 0)}
+
+    return intake
+
+
+def handoff(state: PipelineState) -> dict:
+    """Chat -> build. Answers the start_build call and switches to the first chosen stage."""
+    messages = state["messages"]
+    calls = messages[-1].tool_calls
+    builds = state.get("builds", 0)
+    error = None
+    steps: list[str] = []
+    task = ""
+    if len(calls) != 1:
+        error = "start_build must be called on its own, without other tool calls in the same message."
+    elif builds >= MAX_BUILDS_PER_TURN:
+        error = (f"{builds} builds were already started for this message. Talk to the user "
+                 f"before starting another.")
+    else:
+        args = calls[0].get("args") or {}
+        task = str(args.get("task") or "").strip()
+        if not task:
+            error = "'task' must not be empty."
+        else:
+            try:
+                steps = normalize_build_steps(args.get("steps"))
+            except ValueError as exc:
+                error = str(exc)
+    if error:  # every tool call must be answered; stay in chat so the model can react
+        return {"messages": [_error_message(c, error) for c in calls]}
+
+    first = steps[0]
+    plan = " -> ".join(s for s in ("plan", "code", "review", "commit")
+                       if tools_module.STEP_TO_STAGE[s] in steps)
+    result = ToolMessage(content=f"Build started with steps: {plan}.", tool_call_id=calls[0]["id"],
+                         name="start_build", status="success")
+    note = HumanMessage(content="[pipeline] " + BUILD_START[first].replace("{task}", task[:4000]))
+    return {"messages": [result, note], "stage": first, "steps": steps,
+            "stage_start": len(messages) + 2, "revisions": 0, "nudges": 0, "status": "",
+            "reviewed_tree": "", "builds": builds + 1}
 
 
 def advance(state: PipelineState) -> dict:
@@ -160,21 +253,24 @@ def advance(state: PipelineState) -> dict:
     stage = state["stage"]
     window = _window(state)
     done = _succeeded(window)
+    chosen = state.get("steps") or list(STAGES)
 
     if stage == "planner":
         missing = {"update_plan", "update_todo"} - done
         if not missing:
-            return _go(state, "coder")
+            nxt = _next_stage(state, "planner")
+            return _go(state, nxt) if nxt else _conclude(state, "coded")
         return _nudge(state, "Before the pipeline can continue you must call "
                              + " and ".join(sorted(missing)) + ".")
 
     if stage == "coder":
         if done & {"write_file", "edit_file"}:
-            return _go(state, "reviewer")
+            nxt = _next_stage(state, "coder")
+            return _go(state, nxt) if nxt else _conclude(state, "coded")
         if state["revisions"] == 0:
             # Nothing was changed (a question, or the coder could not proceed): nothing to
-            # review or commit, so the run ends here and the coder's answer is the result.
-            return _finish("no_changes")
+            # review or commit, so the build ends here.
+            return _conclude(state, "no_changes")
         return _nudge(state, "The reviewer requested changes. Make real edits with "
                              "write_file/edit_file to address the feedback.")
 
@@ -197,24 +293,27 @@ def advance(state: PipelineState) -> dict:
                 return _nudge(state, "Files changed after the review (for example tests wrote "
                                      "files), so the approval does not cover them. Call "
                                      "review_changes again.")
-            return _go(state, "committer", reviewed_tree=reviewed)
+            nxt = _next_stage(state, "reviewer")
+            if nxt:
+                return _go(state, nxt, reviewed_tree=reviewed)
+            return _conclude(state, "reviewed", reviewed_tree=reviewed)
         if verdict == "NO_CHANGES":
-            return _finish("no_changes", "The reviewer found no changes to commit.")
-        if state["revisions"] >= max_review_rounds():
-            return _finish("review_failed",
-                           f"Review still requests changes after {state['revisions']} "
-                           f"revision round(s); nothing was committed.\n\n{review_text[:3000]}")
+            return _conclude(state, "no_changes", "The reviewer found no changes to commit.")
+        if state["revisions"] >= max_review_rounds() or "coder" not in chosen:
+            return _conclude(state, "review_failed",
+                             f"Review requests changes (revision rounds used: "
+                             f"{state['revisions']}); nothing was committed.\n\n{review_text[:3000]}")
         return _go(state, "coder",
                    "The reviewer requested changes. Address every point:\n\n" + review_text[:6000],
                    revisions=state["revisions"] + 1)
 
     if stage == "committer":
         if "git_commit" in done:
-            return _finish("committed")
+            return _conclude(state, "committed")
         return _nudge(state, "Stage the changes with git_add and call git_commit with a clear "
                              "message. The pipeline only finishes once git_commit succeeds.")
 
-    return _finish(state.get("status") or "stalled")
+    return _conclude(state, state.get("status") or "stalled")
 
 
 def _allowed_calls(state: PipelineState, calls: list[dict]) -> list[dict]:
@@ -223,14 +322,20 @@ def _allowed_calls(state: PipelineState, calls: list[dict]) -> list[dict]:
 
 
 def route_after_model(state: PipelineState) -> str:
-    last = state["messages"][-1]
-    calls = getattr(last, "tool_calls", None) or []
+    stage = state["stage"]
+    calls = getattr(state["messages"][-1], "tool_calls", None) or []
     if not calls:
-        return "advance"
+        return END if stage == CHAT_STAGE else "advance"
+    if stage == CHAT_STAGE and any(c["name"] == "start_build" for c in calls):
+        return "handoff"
     # Only calls that will actually run can require approval.
     if any(requires_approval(c["name"]) for c in _allowed_calls(state, calls)):
         return "approval"
     return "tools"
+
+
+# Tools that would move unreviewed content into history.
+COMMIT_GUARDED_TOOLS = frozenset({"git_add", "git_commit"})
 
 
 def tools_node(state: PipelineState) -> dict:
@@ -255,44 +360,55 @@ def tools_node(state: PipelineState) -> dict:
     return {"messages": results}
 
 
-# Tools that would move unreviewed content into history.
-COMMIT_GUARDED_TOOLS = frozenset({"git_add", "git_commit"})
+def _tag(reply, stage: str):
+    """Remember which stage produced a message (shown when a conversation is reopened)."""
+    try:
+        reply.response_metadata = {**(reply.response_metadata or {}), "stage": stage}
+    except Exception:  # not every message type allows it
+        pass
+    return reply
 
 
-def _error_message(call: dict, text: str) -> ToolMessage:
-    return ToolMessage(content="ERROR: " + text, tool_call_id=call["id"], name=call["name"],
-                       status="error")
-
-
-def _build_pipeline_graph(model, checkpointer):
-    prompts = {s: render_prompt(STAGE_PROMPTS[s], tools_module.WORKSPACE) for s in STAGES}
-    bound = {s: model.bind_tools([TOOLS_BY_NAME[n] for n in STAGE_TOOLS[s]]) for s in STAGES}
+def _build_pipeline_graph(model, checkpointer, chat: bool):
+    workspace = tools_module.WORKSPACE
+    prompts = {s: render_prompt(STAGE_PROMPTS[s], workspace) for s in STAGES}
+    prompts[CHAT_STAGE] = render_prompt(CHAT_PROMPT, workspace)
+    stages = ((CHAT_STAGE,) if chat else ()) + STAGES
+    bound = {s: model.bind_tools([TOOLS_BY_NAME[n] for n in STAGE_TOOLS[s]]) for s in stages}
 
     def make_stage_node(stage: str):
         def run(state: PipelineState) -> dict:
             reply = bound[stage].invoke([SystemMessage(content=prompts[stage]),
                                          *state["messages"]])
-            return {"messages": [reply]}
+            return {"messages": [_tag(reply, stage)]}
         run.__name__ = stage
         return run
 
     graph = StateGraph(PipelineState)
-    graph.add_node("intake", intake)
-    for stage in STAGES:
+    graph.add_node("intake", make_intake(chat))
+    for stage in stages:
         graph.add_node(stage, make_stage_node(stage))
     graph.add_node("approval", lambda state: {})  # pure interrupt point, does no work
     graph.add_node("tools", tools_node)
     graph.add_node("advance", advance)
 
-    graph.add_edge(START, "intake")
-    graph.add_edge("intake", "planner")
-    for stage in STAGES:
-        graph.add_conditional_edges(stage, route_after_model,
-                                    {"approval": "approval", "tools": "tools", "advance": "advance"})
+    route_targets = {"approval": "approval", "tools": "tools", "advance": "advance"}
+    if chat:
+        graph.add_node("handoff", handoff)
+        route_targets.update({"handoff": "handoff", END: END})
+        graph.add_edge(START, "intake")
+        graph.add_edge("intake", CHAT_STAGE)
+        graph.add_conditional_edges("handoff", lambda state: state["stage"],
+                                    {s: s for s in stages})
+    else:
+        graph.add_edge(START, "intake")
+        graph.add_edge("intake", "planner")
+    for stage in stages:
+        graph.add_conditional_edges(stage, route_after_model, route_targets)
     graph.add_edge("approval", "tools")
-    graph.add_conditional_edges("tools", lambda state: state["stage"], {s: s for s in STAGES})
+    graph.add_conditional_edges("tools", lambda state: state["stage"], {s: s for s in stages})
     graph.add_conditional_edges("advance", lambda state: state["stage"],
-                                {**{s: s for s in STAGES}, "done": END})
+                                {**{s: s for s in stages}, "done": END})
     return graph.compile(checkpointer=checkpointer, interrupt_before=["approval"])
 
 
@@ -305,29 +421,33 @@ def build_graph(mode: str | None = None, model=None, checkpointer=None):
     if mode not in MODES:
         raise ValueError(f"unknown mode '{mode}', expected one of {MODES}")
     model = model if model is not None else get_chat_model()
-    checkpointer = checkpointer if checkpointer is not None else _checkpointer
+    checkpointer = checkpointer if checkpointer is not None else history.get_checkpointer()
     if mode == "react":
         return _build_react_graph(model, checkpointer)
-    return _build_pipeline_graph(model, checkpointer)
+    return _build_pipeline_graph(model, checkpointer, chat=(mode == "auto"))
 
 
 def get_graph(mode: str | None = None):
     """Return the cached compiled graph for `mode` (building it on first use)."""
     mode = mode or default_mode()
-    if mode not in _graphs:
-        _graphs[mode] = build_graph(mode)
-    return _graphs[mode]
+    key = (mode, history.db_path())
+    if key not in _graphs:
+        _graphs[key] = build_graph(mode)
+    return _graphs[key]
 
 
 # ---------------------------------------------------------------------------
 # shared driver used by both the CLI and the Streamlit app
 # ---------------------------------------------------------------------------
-def make_config(thread_id: str) -> dict:
+def make_config(thread_id: str, mode: str | None = None) -> dict:
     try:
         limit = int(os.getenv("RECURSION_LIMIT", "150"))
     except ValueError:
         limit = 150
-    return {"configurable": {"thread_id": thread_id}, "recursion_limit": limit}
+    configurable = {"thread_id": thread_id}
+    if mode:
+        configurable["mode"] = mode  # remembered in the conversation index by drive()
+    return {"configurable": configurable, "recursion_limit": limit}
 
 
 def _call_info(call: dict) -> dict:
@@ -374,7 +494,8 @@ def reject_tool_calls(graph, config, reason: str = "") -> list[ToolMessage]:
 def message_to_event(node: str, message) -> dict:
     """Convert a LangChain message into a small UI-friendly dict."""
     if isinstance(message, AIMessage):
-        return {"kind": "ai", "node": node, "content": content_to_text(message.content),
+        stage = (getattr(message, "response_metadata", None) or {}).get("stage")
+        return {"kind": "ai", "node": stage or node, "content": content_to_text(message.content),
                 "tool_calls": [_call_info(c) for c in (message.tool_calls or [])]}
     if isinstance(message, ToolMessage):
         return {"kind": "tool", "node": node, "name": message.name or "tool",
@@ -382,6 +503,27 @@ def message_to_event(node: str, message) -> dict:
                 "error": getattr(message, "status", "success") == "error",
                 "tool_call_id": message.tool_call_id}
     return {"kind": "pipeline", "node": node, "content": content_to_text(message.content)}
+
+
+def messages_to_events(messages) -> list[dict]:
+    """Rebuild the display log of a stored conversation."""
+    events: list[dict] = []
+    for message in messages:
+        if isinstance(message, HumanMessage):
+            text = content_to_text(message.content)
+            if text.startswith("[pipeline]"):
+                events.append({"kind": "pipeline", "node": "pipeline", "content": text})
+            else:
+                events.append({"kind": "user", "content": text})
+        elif isinstance(message, (AIMessage, ToolMessage)):
+            events.append(message_to_event("agent", message))
+    return events
+
+
+def history_events(graph, config) -> list[dict]:
+    """Display events of the conversation stored under config's thread (empty if unknown)."""
+    values = graph.get_state(config).values or {}
+    return messages_to_events(values.get("messages") or [])
 
 
 def _events_from_chunk(chunk: dict) -> Iterator[dict]:
@@ -400,7 +542,18 @@ def get_run_status(graph, config) -> dict:
     snapshot = graph.get_state(config)
     values = snapshot.values or {}
     return {"stage": values.get("stage"), "status": values.get("status", ""),
-            "revisions": values.get("revisions", 0), "waiting": bool(snapshot.next)}
+            "revisions": values.get("revisions", 0), "steps": values.get("steps") or [],
+            "waiting": bool(snapshot.next)}
+
+
+def _remember(config, user_text: str) -> None:
+    """Record the conversation in the index; persistence problems must never stop the chat."""
+    try:
+        configurable = config.get("configurable", {})
+        history.record(configurable["thread_id"], configurable.get("mode") or default_mode(),
+                       str(tools_module.WORKSPACE), user_text)
+    except Exception:
+        pass
 
 
 def drive(graph, config, user_text: str | None = None) -> Iterator[dict]:
@@ -411,7 +564,10 @@ def drive(graph, config, user_text: str | None = None) -> Iterator[dict]:
     Batches containing only safe tools are resumed automatically.
     After the generator ends, call pending_tool_calls() to see whether approval is needed.
     """
-    graph_input: Any = {"messages": [HumanMessage(content=user_text)]} if user_text is not None else None
+    graph_input: Any = None
+    if user_text is not None:
+        _remember(config, user_text)
+        graph_input = {"messages": [HumanMessage(content=user_text)]}
     while True:
         for chunk in graph.stream(graph_input, config, stream_mode="updates"):
             yield from _events_from_chunk(chunk)
