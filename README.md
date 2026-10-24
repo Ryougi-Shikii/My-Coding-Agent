@@ -184,4 +184,14 @@ python -m pytest
 The suite uses a scripted fake chat model and mocks Docker, so it needs neither an API key nor a Docker daemon.
 It checks the tools, path safety, the exact `docker run` / `docker build` commands, the approval policy, the stage enforcement
 (including attempts to bypass it), the CLI, and `app.py` driven through a fake `streamlit` module.
-It does **not** run a real container or call a real model, so do a first run with your own key and Docker before relying on it.
+That suite does **not** run a real container or call a real model. For that there are opt-in integration tests
+(`tests/test_integration.py`) that skip themselves when Docker or your API key is missing:
+
+```bash
+python -m pytest --integration              # real Docker + real model
+python -m pytest --integration -m docker    # Docker only (no key needed): output, no network, read-only fs, timeout, image build
+python -m pytest --integration -m llm       # model only: answers, tool calls, "hi" in auto mode, end-to-end build + commit
+```
+
+The LLM tests make a few short API calls. The end-to-end test depends on the model's behaviour, so an occasional failure there
+is a signal to look at the transcript, not necessarily a bug.
