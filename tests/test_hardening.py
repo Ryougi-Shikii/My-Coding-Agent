@@ -15,7 +15,7 @@ from langchain_core.messages import AIMessage
 from agent import graph as g
 from agent import sandbox
 from agent import tools as t
-from tests.conftest import git
+from tests.conftest import git, symlink
 from tests.fakes import ScriptedChatModel, ai, call
 from tests.test_graph import committer_steps, happy_script, new_graph, planner_steps, run_to_end, status_of
 
@@ -51,7 +51,7 @@ class TestHostileGitDirectory:
     def plant_filter(self, ws):
         subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
         with open(ws / ".git" / "config", "a") as handle:
-            handle.write(f'[filter "x"]\n\tclean = touch {ws}/PWNED; cat\n')
+            handle.write(f'[filter "x"]\n\tclean = touch {ws.as_posix()}/PWNED; cat\n')
         (ws / ".gitattributes").write_text("* filter=x\n")
         (ws / "a.txt").write_text("hello")
 
@@ -61,7 +61,7 @@ class TestHostileGitDirectory:
                            (t.git_log, {}), (t.git_commit, {"message": "m"}),
                            (t.review_changes, {}), (t.git_init, {})]:
             out = tool.invoke(args)
-            assert out.startswith("ERROR") and "unsupported setting" in out, (tool.name, out)
+            assert out.startswith("ERROR") and ("unsupported setting" in out or "cannot parse" in out), (tool.name, out)
         assert not (ws / "PWNED").exists()
 
     @pytest.mark.parametrize("section", ['[diff]\n\texternal = touch PWNED', '[core]\n\tsshCommand = x',
@@ -86,7 +86,7 @@ class TestHostileGitDirectory:
     def test_git_symlink_and_alternates_rejected(self, ws, tmp_path):
         other = tmp_path / "other"
         subprocess.run(["git", "init", "-q", str(other)], check=True)
-        os.symlink(other / ".git", ws / ".git")
+        symlink(other / ".git", ws / ".git")
         assert t.git_status.invoke({}).startswith("ERROR")
         os.unlink(ws / ".git")
         subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
@@ -198,8 +198,8 @@ class TestSpecialFiles:
         os.mkfifo(ws / "pipe")
         outside = tmp_path / "secret.txt"
         outside.write_text("needle outside")
-        os.symlink(outside, ws / "link.txt")
-        os.symlink("/dev/zero", ws / "zero")
+        symlink(outside, ws / "link.txt")
+        symlink("/dev/zero", ws / "zero")
         (ws / "real.txt").write_text("needle inside\n")
         assert t.search_text.invoke({"query": "needle"}) == "real.txt:1: needle inside"
 
@@ -210,7 +210,7 @@ class TestSpecialFiles:
     def test_check_python_syntax_ignores_symlinks_and_fifos(self, ws, tmp_path, alarm):
         outside = tmp_path / "outside.py"
         outside.write_text("def broken(:\n")
-        os.symlink(outside, ws / "l.py")
+        symlink(outside, ws / "l.py")
         os.mkfifo(ws / "p.py")
         (ws / "ok.py").write_text("x = 1\n")
         assert t.check_python_syntax.invoke({"path": "."}) == "Syntax OK (1 file(s) checked)."
@@ -261,7 +261,7 @@ class TestReviewedTreeEnforcement:
         os.remove(git_ready / "a.py")
         gone = t.tree_fingerprint()
         assert gone != base
-        os.symlink("/etc/hostname", git_ready / "ln")
+        symlink("/etc/hostname", git_ready / "ln")
         assert t.tree_fingerprint() != gone
 
     def reviewed_state(self, ws):
@@ -329,7 +329,7 @@ class TestReviewedTreeEnforcement:
     def test_hostile_git_dir_stops_the_pipeline_without_executing_anything(self, fake_llm, ws):
         subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
         with open(ws / ".git" / "config", "a") as handle:
-            handle.write(f'[filter "x"]\n\tclean = touch {ws}/PWNED; cat\n')
+            handle.write(f'[filter "x"]\n\tclean = touch {ws.as_posix()}/PWNED; cat\n')
         (ws / ".gitattributes").write_text("* filter=x\n")
         script = happy_script()
         script["reviewer"] = [ai("", call("git_init")), ai("", call("review_changes")), "x"] * 3

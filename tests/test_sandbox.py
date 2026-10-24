@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import symlink
+
 from agent import sandbox as sb
 
 
@@ -53,6 +55,7 @@ class TestDockerCommand:
     def test_root_host_falls_back_to_nobody(self, root, monkeypatch):
         monkeypatch.delenv("SANDBOX_USER", raising=False)
         monkeypatch.setattr(sb.os, "getuid", lambda: 0, raising=False)
+        monkeypatch.setattr(sb.os, "getgid", lambda: 0, raising=False)
         assert flag_value(sb.build_docker_command(root, "i", ["a"], "n"), "--user") == "65534:65534"
 
     def test_user_override_is_validated(self, root, monkeypatch):
@@ -101,7 +104,7 @@ class TestArgValidation:
     def test_symlink_to_outside_py_rejected(self, root, tmp_path, monkeypatch):
         outside = tmp_path / "evil.py"
         outside.write_text("print('pwn')")
-        (root / "link.py").symlink_to(outside)
+        symlink(outside, root / "link.py")
         monkeypatch.setattr(sb, "docker_available", lambda force=False: True)
         monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("must not run"))
         assert str(sb.run_python_in_sandbox(root, "link.py")).startswith("ERROR")

@@ -8,7 +8,7 @@ import pytest
 
 from agent import sandbox
 from agent import tools as t
-from tests.conftest import git
+from tests.conftest import git, symlink
 from tests.fakes import ScriptedChatModel
 
 
@@ -31,7 +31,7 @@ class TestPathSafety:
     def test_symlink_escape_rejected(self, ws, tmp_path):
         outside = tmp_path / "secret.txt"
         outside.write_text("top secret")
-        os.symlink(outside, ws / "link.txt")
+        symlink(outside, ws / "link.txt")
         assert run(t.read_file, path="link.txt").startswith("ERROR")
         assert run(t.write_file, path="link.txt", content="pwn").startswith("ERROR")
         assert outside.read_text() == "top secret"
@@ -39,7 +39,7 @@ class TestPathSafety:
     def test_symlinked_directory_escape_rejected(self, ws, tmp_path):
         outside = tmp_path / "outdir"
         outside.mkdir()
-        os.symlink(outside, ws / "d")
+        symlink(outside, ws / "d")
         assert run(t.write_file, path="d/x.txt", content="pwn").startswith("ERROR")
         assert not (outside / "x.txt").exists()
 

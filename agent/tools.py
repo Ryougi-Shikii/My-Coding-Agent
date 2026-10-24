@@ -196,7 +196,8 @@ def write_file(path: str, content: str) -> str:
     if len(content) > MAX_WRITE_CHARS:
         return f"ERROR: content too large (max {MAX_WRITE_CHARS} characters)"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    with target.open("w", encoding="utf-8", newline="") as handle:  # no CRLF translation on Windows
+        handle.write(content)
     return f"Wrote {len(content)} characters to {_rel(target)}"
 
 
@@ -213,15 +214,17 @@ def edit_file(path: str, find: str, replace: str, replace_all: bool = False) -> 
         return f"ERROR: '{path}' is too large to edit"
     if not find:
         return "ERROR: 'find' must not be empty"
-    text = target.read_text(encoding="utf-8")
+    with target.open("r", encoding="utf-8", newline="") as handle:
+        text = handle.read()
     count = text.count(find)
     if count == 0:
         return "ERROR: 'find' text not found. Re-read the file and copy the text exactly."
     if count > 1 and not replace_all:
         return (f"ERROR: 'find' matches {count} places. Add more surrounding context "
                 f"or pass replace_all=true.")
-    target.write_text(text.replace(find, replace) if replace_all else text.replace(find, replace, 1),
-                      encoding="utf-8")
+    updated = text.replace(find, replace) if replace_all else text.replace(find, replace, 1)
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(updated)
     return f"Replaced {count if replace_all else 1} occurrence(s) in {_rel(target)}"
 
 

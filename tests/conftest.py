@@ -88,3 +88,13 @@ def fake_llm(ws, monkeypatch):
 def git(root: Path, *args: str) -> str:
     """Run git in `root` for assertions (independent of the code under test)."""
     return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True).stdout
+
+
+def symlink(target, link) -> None:
+    """os.symlink that skips the test where the OS forbids it (Windows without Developer Mode)."""
+    import os
+
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create symlinks here: {exc}")

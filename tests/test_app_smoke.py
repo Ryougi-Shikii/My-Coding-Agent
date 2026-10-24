@@ -257,7 +257,7 @@ def test_runtime_error_is_displayed(app, ws):
 
 
 def test_app_source_uses_the_required_session_state_and_widgets():
-    source = APP.read_text()
+    source = APP.read_text(encoding="utf-8")
     for needle in ("st.session_state", "thread_id", "docker_available", "get_sandbox_image",
                    "workspace_top_level", "New conversation", "Approve", "Reject",
                    "reject_tool_calls", "pending_tool_calls", "st.chat_input"):

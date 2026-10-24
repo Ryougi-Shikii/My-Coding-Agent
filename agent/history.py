@@ -80,7 +80,13 @@ def get_checkpointer():
         if path == ":memory:":
             _saver = MemorySaver()
         else:
-            from langgraph.checkpoint.sqlite import SqliteSaver  # optional dependency
+            try:
+                from langgraph.checkpoint.sqlite import SqliteSaver
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Saving conversations needs the 'langgraph-checkpoint-sqlite' package. "
+                    "Run: pip install -r requirements.txt   (or set CONVERSATION_DB=memory to "
+                    "run without saving)") from exc
 
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             # check_same_thread=False: Streamlit runs scripts on several threads.

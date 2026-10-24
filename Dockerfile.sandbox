@@ -9,14 +9,10 @@ ENV PIP_NO_CACHE_DIR=1 \
 RUN pip install \
     pytest \
     pytest-cov \
-    requests \
-    httpx \
     pydantic \
-    fastapi \
     numpy \
     pandas \
-    matplotlib \
-    beautifulsoup4
+    matplotlib
 
 # ==============================================================================
 # HOW TO BUILD AND USE THIS SANDBOX IMAGE:

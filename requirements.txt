@@ -6,5 +6,6 @@ langchain
 langchain-openai
 langchain-anthropic
 langchain-google-genai
+langgraph-checkpoint-sqlite
 # Optional: xAI / Grok support (set LLM_PROVIDER=xai)
 # langchain-xai

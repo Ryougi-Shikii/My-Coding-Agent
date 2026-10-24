@@ -15,3 +15,6 @@ workspace/*
 
 # Saved conversations
 .data/
+
+# my files
+_*
