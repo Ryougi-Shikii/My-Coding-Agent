@@ -14,6 +14,22 @@ from agent import tools as tools_module
 from tests.fakes import ScriptedChatModel
 
 
+def pytest_addoption(parser):
+    parser.addoption("--integration", action="store_true", default=False,
+                     help="also run tests that use real Docker and/or a real LLM API key")
+
+
+def pytest_collection_modifyitems(config, items):
+    import os
+
+    if config.getoption("--integration") or os.getenv("RUN_INTEGRATION") == "1":
+        return
+    skip = pytest.mark.skip(reason="integration test: run with `pytest --integration`")
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
 def isolated_history(tmp_path, monkeypatch):
     """Every test gets its own conversation database: tests never touch real saved chats."""
