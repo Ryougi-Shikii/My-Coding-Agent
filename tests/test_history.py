@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 import cli
 from agent import graph as g
 from agent import history
@@ -172,7 +170,7 @@ class TestCliResume:
         assert "mode:       auto" in term.text
 
     def test_mode_command_keeps_the_conversation(self, fake_llm, ws):
-        model = fake_llm({"chat": ["chat reply"], "react": ["react reply"]})
+        fake_llm({"chat": ["chat reply"], "react": ["react reply"]})
         term = Terminal("hello", "/mode", "/mode react", "again", "/mode bogus", "/exit")
         run(term)
         assert "Mode is now react" in term.text and "react reply" in term.text

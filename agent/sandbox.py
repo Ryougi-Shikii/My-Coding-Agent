@@ -69,6 +69,48 @@ def build_timeout() -> int:
     return _env_int("BUILD_TIMEOUT", 600)
 
 
+_MEMORY_RE = re.compile(r"^\d{1,6}[kKmMgG]?$")
+_CPUS_RE = re.compile(r"^\d{1,2}(\.\d{1,2})?$")
+
+
+def sandbox_memory() -> str:
+    """Memory limit of the sandbox container (SANDBOX_MEMORY, e.g. 512m or 2g)."""
+    value = os.getenv("SANDBOX_MEMORY", "").strip()
+    return value if _MEMORY_RE.match(value) else "512m"
+
+
+def sandbox_cpus() -> str:
+    value = os.getenv("SANDBOX_CPUS", "").strip()
+    return value if _CPUS_RE.match(value) and float(value) > 0 else "1"
+
+
+def sandbox_pids() -> int:
+    return _env_int("SANDBOX_PIDS", 256)
+
+
+def sandbox_tmp_mb() -> int:
+    return _env_int("SANDBOX_TMP_MB", 128)
+
+
+def source_builds_allowed() -> bool:
+    """pip may build packages from source (runs their setup code) only if explicitly allowed."""
+    return os.getenv("ALLOW_SOURCE_BUILDS", "false").strip().lower() == "true"
+
+
+def package_allowlist() -> set[str] | None:
+    """PACKAGE_ALLOWLIST=numpy,pandas,... restricts install_packages. Unset/empty/'*' = any."""
+    raw = os.getenv("PACKAGE_ALLOWLIST", "").strip()
+    if not raw or raw == "*":
+        return None
+    return {canonical_name(part) for part in raw.split(",") if part.strip()}
+
+
+def canonical_name(requirement: str) -> str:
+    """'Foo_Bar[extra]>=1.0' -> 'foo-bar' (PEP 503 style, enough for allowlist matching)."""
+    name = re.split(r"[\[<>=!~]", requirement.strip(), maxsplit=1)[0]
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def unsafe_local_allowed() -> bool:
     return os.getenv("ALLOW_UNSAFE_LOCAL_EXECUTION", "false").strip().lower() == "true"
 
@@ -224,22 +266,27 @@ def build_docker_command(
     image: str,
     python_args: Sequence[str],
     container_name: str,
+    interactive: bool = False,
 ) -> list[str]:
-    """Build the locked-down `docker run` command (pure function, easy to test)."""
+    """Build the locked-down `docker run` command (pure function, easy to test).
+
+    interactive=True adds `-i` so the code can be sent on stdin (`python -`)."""
     root = Path(workspace_root).resolve()
-    cmd = [
-        "docker", "run",
-        "--rm",
+    memory = sandbox_memory()
+    cmd = ["docker", "run", "--rm"]
+    if interactive:
+        cmd.append("-i")
+    cmd += [
         "--name", container_name,
         "--network", "none",
-        "--memory", "512m",
-        "--memory-swap", "512m",
-        "--cpus", "1",
-        "--pids-limit", "256",
+        "--memory", memory,
+        "--memory-swap", memory,
+        "--cpus", sandbox_cpus(),
+        "--pids-limit", str(sandbox_pids()),
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--read-only",
-        "--tmpfs", "/tmp:rw,size=128m",
+        "--tmpfs", f"/tmp:rw,size={sandbox_tmp_mb()}m",
         "-e", "HOME=/tmp",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
         "-v", f"{root}:/workspace",
@@ -257,14 +304,16 @@ def build_docker_command(
     return cmd
 
 
-def _run_in_docker(workspace_root: Path, python_args: list[str], timeout: int) -> RunResult:
+def _run_in_docker(workspace_root: Path, python_args: list[str], timeout: int,
+                   stdin: str | None = None) -> RunResult:
     image = get_sandbox_image(workspace_root)
     name = f"lca-run-{uuid.uuid4().hex[:12]}"
-    cmd = build_docker_command(workspace_root, image, python_args, name)
+    cmd = build_docker_command(workspace_root, image, python_args, name,
+                               interactive=stdin is not None)
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
+            timeout=timeout, input=stdin,
         )
     except subprocess.TimeoutExpired as exc:
         # Killing the docker client does not stop the container: remove it explicitly.
@@ -279,7 +328,8 @@ def _run_in_docker(workspace_root: Path, python_args: list[str], timeout: int) -
     return RunResult("docker", image, proc.returncode, proc.stdout, proc.stderr)
 
 
-def _run_locally(workspace_root: Path, python_args: list[str], timeout: int) -> RunResult:
+def _run_locally(workspace_root: Path, python_args: list[str], timeout: int,
+                 stdin: str | None = None) -> RunResult:
     """UNSAFE: runs on the host. Only reachable with ALLOW_UNSAFE_LOCAL_EXECUTION=true."""
     # Minimal environment so API keys from the host are not exposed to agent-written code.
     env = {"PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1",
@@ -290,7 +340,7 @@ def _run_locally(workspace_root: Path, python_args: list[str], timeout: int) -> 
     try:
         proc = subprocess.run(
             [sys.executable, *python_args], cwd=workspace_root, env=env, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout, input=stdin,
         )
     except subprocess.TimeoutExpired as exc:
         return RunResult("local", "", None, _to_text(exc.stdout), _to_text(exc.stderr),
@@ -300,11 +350,12 @@ def _run_locally(workspace_root: Path, python_args: list[str], timeout: int) -> 
     return RunResult("local", "", proc.returncode, proc.stdout, proc.stderr)
 
 
-def _execute(workspace_root: Path, python_args: list[str], timeout: int) -> RunResult:
+def _execute(workspace_root: Path, python_args: list[str], timeout: int,
+             stdin: str | None = None) -> RunResult:
     if docker_available():
-        return _run_in_docker(workspace_root, python_args, timeout)
+        return _run_in_docker(workspace_root, python_args, timeout, stdin)
     if unsafe_local_allowed():
-        return _run_locally(workspace_root, python_args, timeout)
+        return _run_locally(workspace_root, python_args, timeout, stdin)
     return RunResult(
         "none",
         error=(
@@ -335,6 +386,28 @@ def run_python_in_sandbox(
     return _execute(root, args, timeout or execution_timeout())
 
 
+MAX_SNIPPET_CHARS = 200_000
+
+
+def run_code_in_sandbox(
+    workspace_root: str | os.PathLike,
+    code: str,
+    timeout: int | None = None,
+    script_args: Sequence[str] = (),
+) -> RunResult:
+    """Run a Python snippet in the sandbox. The code travels on stdin (`python -`), so nothing is
+    written to the workspace and the code cannot be confused with a command line."""
+    root = Path(workspace_root).resolve()
+    if not isinstance(code, str) or not code.strip():
+        return RunResult("none", error="no code given")
+    if len(code) > MAX_SNIPPET_CHARS:
+        return RunResult("none", error=f"code too long (max {MAX_SNIPPET_CHARS} characters)")
+    if "\x00" in code:
+        return RunResult("none", error="NUL byte in code")
+    return _execute(root, ["-", *[str(a) for a in script_args]], timeout or execution_timeout(),
+                    stdin=code)
+
+
 def run_python_args_in_sandbox(
     workspace_root: str | os.PathLike,
     python_args: Sequence[str],
@@ -360,17 +433,19 @@ import sys
 from pathlib import Path
 
 packages = json.loads(Path(__file__).with_name("packages.json").read_text(encoding="utf-8"))
-subprocess.check_call(
-    [sys.executable, "-m", "pip", "install", "--no-cache-dir",
-     "--disable-pip-version-check", *packages]
-)
+flags = ["--no-cache-dir", "--disable-pip-version-check", "--no-input"]
+if not json.loads(Path(__file__).with_name("source_builds.json").read_text(encoding="utf-8")):
+    # Wheels only: a source distribution would run its setup.py (arbitrary code, as root, WITH
+    # network access) during the build.
+    flags.append("--only-binary=:all:")
+subprocess.check_call([sys.executable, "-m", "pip", "install", *flags, *packages])
 '''
 
 _DOCKERFILE = """\
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
-COPY packages.json install.py /opt/lca-build/
+COPY packages.json source_builds.json install.py /opt/lca-build/
 RUN python /opt/lca-build/install.py
 """
 
@@ -382,6 +457,7 @@ def validate_requirements(packages: Sequence[str]) -> list[str]:
         raise ValueError("no packages given")
     if len(cleaned) > MAX_PACKAGES:
         raise ValueError(f"too many packages (max {MAX_PACKAGES})")
+    allowed = package_allowlist()
     for req in cleaned:
         if not _REQ_RE.match(req):
             raise ValueError(
@@ -389,6 +465,10 @@ def validate_requirements(packages: Sequence[str]) -> list[str]:
                 f"and version specifiers, e.g. requests, numpy>=1.26, pytest==8.2.0 "
                 f"(no spaces, URLs, paths or pip options)."
             )
+        if allowed is not None and canonical_name(req) not in allowed:
+            raise ValueError(
+                f"package '{canonical_name(req)}' is not on the allowlist (PACKAGE_ALLOWLIST). "
+                f"Allowed: {', '.join(sorted(allowed))}")
     return cleaned
 
 
@@ -408,13 +488,16 @@ def install_packages_into_sandbox_image(
                 "(Packages are never installed on the host.)")
 
     base = get_sandbox_image(root)
-    digest = hashlib.sha1(("|".join([base, *sorted(requirements)])).encode()).hexdigest()[:12]
+    digest = hashlib.sha1(("|".join([base, *sorted(requirements),
+                                     "src" if source_builds_allowed() else "whl"])).encode()
+                          ).hexdigest()[:12]
     tag = f"lca-sandbox:{digest}"
 
     with tempfile.TemporaryDirectory(prefix="lca-build-") as tmp:
         ctx = Path(tmp)
         (ctx / "Dockerfile").write_text(_DOCKERFILE, encoding="utf-8")
         (ctx / "packages.json").write_text(json.dumps(requirements), encoding="utf-8")
+        (ctx / "source_builds.json").write_text(json.dumps(source_builds_allowed()), encoding="utf-8")
         (ctx / "install.py").write_text(_INSTALL_SCRIPT, encoding="utf-8")
         # Argument list, no shell: package strings never touch a shell.
         cmd = ["docker", "build", "--build-arg", f"BASE_IMAGE={base}", "-t", tag, str(ctx)]
@@ -437,3 +520,52 @@ def install_packages_into_sandbox_image(
     image_file.write_text(tag + "\n", encoding="utf-8")
     return (f"Installed {' '.join(requirements)} by building image {tag} (from {base}). "
             f"It is now the sandbox image for all future runs.")
+
+
+# ---------------------------------------------------------------------------
+# Image housekeeping: every install builds a new `lca-sandbox:<hash>` image, so old ones pile up
+# ---------------------------------------------------------------------------
+IMAGE_PREFIX = "lca-sandbox:"
+
+
+def referenced_images(workspaces: Sequence[str | os.PathLike]) -> set[str]:
+    """Image tags currently recorded in the given workspaces' sandbox_image.txt files."""
+    tags: set[str] = set()
+    for workspace in workspaces:
+        image_file = Path(workspace).joinpath(*IMAGE_FILE_PARTS)
+        try:
+            tag = image_file.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if tag and _IMAGE_RE.match(tag):
+            tags.add(tag)
+    return tags
+
+
+def prune_unused_images(workspaces: Sequence[str | os.PathLike], keep_extra: int = 0) -> list[str]:
+    """Remove `lca-sandbox:*` images that no workspace refers to. Returns the tags removed.
+
+    Images that are still in use by a container are skipped by Docker itself (rmi fails)."""
+    if not docker_available():
+        return []
+    keep = referenced_images(workspaces)
+    try:
+        listing = subprocess.run(
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}", "--filter",
+             "reference=lca-sandbox"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    candidates = [t.strip() for t in listing.stdout.splitlines()
+                  if t.strip().startswith(IMAGE_PREFIX) and t.strip() not in keep]
+    removed: list[str] = []
+    for tag in candidates[keep_extra:]:
+        if not _IMAGE_RE.match(tag):
+            continue
+        try:
+            done = subprocess.run(["docker", "rmi", tag], capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            removed.append(tag)
+    return removed

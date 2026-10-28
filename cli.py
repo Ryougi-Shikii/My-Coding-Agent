@@ -18,6 +18,8 @@ import sys
 from typing import Callable
 
 from agent import history, sandbox
+from agent import tools as agent_tools
+from agent import usage as usage_module
 from agent.graph import (
     MODE_HELP,
     MODES,
@@ -32,7 +34,6 @@ from agent.graph import (
     pending_tool_calls,
     reject_tool_calls,
 )
-from agent import tools as agent_tools
 from agent.llm import describe_llm
 from agent.tools import approval_mode, read_agent_state
 
@@ -40,7 +41,8 @@ HELP = """\
 Commands:
   /help           show this help
   /state          show the saved plan, todo list and memory
-  /status         show the current stage / build status of this conversation
+  /status         show the current stage / build status, token usage and workspace
+  /outputs        list the files the agent left in out/ (deliverables)
   /new            start a new conversation
   /list           list saved conversations of this workspace
   /resume [n|id]  continue a saved conversation (no argument: choose from a list)
@@ -167,7 +169,6 @@ class Session:
     """The conversation currently open in the terminal."""
 
     def __init__(self, mode: str, thread_id: str | None = None):
-        self.workspace = str(agent_tools.WORKSPACE)
         self.mode = mode
         self.thread_id = thread_id or history.new_thread_id()
         self.graph = get_graph(mode)
@@ -177,6 +178,11 @@ class Session:
         self.mode, self.thread_id = mode, thread_id
         self.graph = get_graph(mode)
         self.config = make_config(thread_id, mode)
+
+    @property
+    def workspace(self) -> str:
+        """This conversation's own workspace (or the shared one)."""
+        return str(agent_tools.workspace_for(self.thread_id))
 
     def pending(self) -> bool:
         return bool(pending_tool_calls(self.graph, self.config))
@@ -194,7 +200,7 @@ def run_cli(argv: list[str] | None = None, input_fn: Callable[[str], str] = inpu
     group.add_argument("--list", "-l", action="store_true", help="list saved conversations and exit")
     args = parser.parse_args(argv)
     st = Style(sys.stdout.isatty())
-    workspace = str(agent_tools.WORKSPACE)
+    workspace = agent_tools.workspace_scope()  # groups the conversations in /list
 
     if args.list:
         rows = history.list_conversations(workspace)
@@ -225,8 +231,9 @@ def run_cli(argv: list[str] | None = None, input_fn: Callable[[str], str] = inpu
     output_fn(f"  model:      {describe_llm()}")
     output_fn(f"  mode:       {session.mode} - {MODE_HELP[session.mode]}")
     output_fn(f"  approval:   {approval_mode()} (dangerous tools need your approval)")
-    output_fn(f"  workspace:  {workspace}")
-    output_fn(f"  docker:     {docker}, image {sandbox.get_sandbox_image(agent_tools.WORKSPACE)}")
+    output_fn(f"  workspace:  {session.workspace}"
+              + ("" if agent_tools.workspace_mode() == "shared" else "  (own workspace per conversation)"))
+    output_fn(f"  docker:     {docker}, image {sandbox.get_sandbox_image(session.workspace)}")
     if not history.persistent():
         output_fn("  history:    NOT saved (CONVERSATION_DB=memory)")
     output_fn("Type /help for commands.\n")
@@ -273,7 +280,18 @@ def run_cli(argv: list[str] | None = None, input_fn: Callable[[str], str] = inpu
         elif command == "/state":
             output_fn(read_agent_state.invoke({}))
         elif command == "/status":
-            output_fn(str(get_run_status(session.graph, session.config)))
+            status = get_run_status(session.graph, session.config)
+            usage_totals = status.pop("usage", None)
+            output_fn(str(status))
+            if usage_totals:
+                output_fn("usage: " + usage_module.format_usage(usage_totals))
+            output_fn(f"workspace: {session.workspace}")
+        elif command == "/outputs":
+            files = agent_tools.output_files(agent_tools.workspace_for(session.thread_id))
+            output_fn("\n".join(f"  {path}  ({size:,} bytes)" for path, size in files) if files
+                      else "No files in out/ yet.")
+            if files:
+                output_fn(f"(in {session.workspace})")
         elif command == "/list":
             rows = history.list_conversations(workspace)
             output_fn("\n".join(conversation_lines(rows, session.thread_id)) if rows
@@ -320,7 +338,7 @@ def run_cli(argv: list[str] | None = None, input_fn: Callable[[str], str] = inpu
             else:
                 session.open(session.thread_id, argument)
                 if history.get_conversation(session.thread_id):  # already saved: remember the new mode
-                    history.record(session.thread_id, argument, workspace)
+                    history.record(session.thread_id, argument, session.workspace)
                 output_fn(f"Mode is now {argument}. The conversation continues.")
         elif line.startswith("/"):
             output_fn(f"Unknown command {command}. Type /help.")

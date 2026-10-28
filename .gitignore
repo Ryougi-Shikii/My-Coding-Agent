@@ -5,16 +5,21 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 .venv/
 venv/
 
-# The agent's working directory holds generated projects, plans and memory.
-# Keep the directory itself, not its contents.
+# The agent's working directories hold generated projects, plans and memory.
+# Keep the directories themselves, not their contents.
+# workspace/  = shared mode (WORKSPACE_MODE=shared); workspaces/ = one directory per conversation
 workspace/*
 !workspace/.gitkeep
+workspaces/*
+!workspaces/.gitkeep
 
-# Saved conversations
+# Saved conversations and eval results
 .data/
+evals/results/
 
-# my files
-_*
+# my scratch files (only at the project root; a bare "_*" would also hide new __init__.py files)
+/_*

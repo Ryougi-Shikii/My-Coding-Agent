@@ -17,7 +17,7 @@ from agent import sandbox
 from agent import tools as t
 from tests.conftest import git, symlink
 from tests.fakes import ScriptedChatModel, ai, call
-from tests.test_graph import committer_steps, happy_script, new_graph, planner_steps, run_to_end, status_of
+from tests.test_graph import happy_script, new_graph, run_to_end, status_of
 
 
 def run(tool, **args):
@@ -174,7 +174,7 @@ class TestLargeDiffReview:
         monkeypatch.setattr(t, "REVIEW_CHUNK_CHARS", 400)
         monkeypatch.setattr(t, "MAX_REVIEW_CHUNKS", 50)
         run(t.write_file, path="big.py", content="".join(f"value_{i} = {i}\n" for i in range(100)))
-        seen = self.reviewer(monkeypatch, ["APPROVE", "REQUEST_CHANGES"] + ["APPROVE"] * 50)
+        self.reviewer(monkeypatch, ["APPROVE", "REQUEST_CHANGES"] + ["APPROVE"] * 50)
         assert t.parse_verdict(t.review_changes.invoke({})) == "REQUEST_CHANGES"
 
     def test_too_large_to_review_is_never_approved(self, git_ready, monkeypatch):

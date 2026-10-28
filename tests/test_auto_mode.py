@@ -243,7 +243,8 @@ class TestHandoffGuardRails:
         assert set(model.roles()) == {"chat"}
 
     def test_builds_per_message_are_limited(self, fake_llm, ws):
-        sb = lambda: ai("", call("start_build", task="again", steps=["code"]))
+        def sb():
+            return ai("", call("start_build", task="again", steps=["code"]))
         script = {"chat": [sb(), sb(), sb(), sb(), "I'll stop here."], "coder": ["nothing to do"] * 3}
         model = fake_llm(script)
         graph, config = auto(model)

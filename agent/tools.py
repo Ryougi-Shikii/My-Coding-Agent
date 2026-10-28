@@ -7,19 +7,23 @@ string starting with "ERROR" (the graph marks such ToolMessages with status="err
 from __future__ import annotations
 
 import ast
+import base64
 import functools
 import hashlib
 import os
 import re
 import stat
+import struct
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
-from agent import PROJECT_ROOT, sandbox
+from agent import PROJECT_ROOT, sandbox, usage
 from agent.llm import content_to_text, get_chat_model
 from agent.prompts import REVIEW_PROMPT
 
@@ -28,31 +32,110 @@ from agent.prompts import REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
 
-def _resolve_workspace() -> Path:
-    path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).expanduser()
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, "").strip() or default)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _resolve_dir(env_name: str, default: str) -> Path:
+    path = Path(os.getenv(env_name, default)).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path  # relative paths are relative to the project root
     return path.resolve()
 
 
+def _resolve_workspace() -> Path:
+    return _resolve_dir("WORKSPACE_DIR", "./workspace")
+
+
+# The shared workspace (WORKSPACE_MODE=shared) and the fallback when no session is active.
 WORKSPACE: Path = _resolve_workspace()
 
 IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
-MAX_READ_CHARS = 60_000
+# Smaller read limit = smaller context = lower cost. read_file can read a line range instead.
+MAX_READ_CHARS = _env_int("MAX_READ_CHARS", 30_000)
 MAX_WRITE_CHARS = 1_000_000
 MAX_OUTPUT_CHARS = 20_000
 MAX_LIST_ENTRIES = 300
 MAX_SEARCH_MATCHES = 100
+OUTPUT_DIR = "out"  # deliverables (videos, images, reports) go here; the UIs offer them for download
+
+
+# ---------------------------------------------------------------------------
+# Which workspace is active?
+#
+# WORKSPACE_MODE=session (default): every conversation gets its own directory
+#   <WORKSPACES_DIR>/<thread_id> (default ./workspaces), with its own git repository, plan,
+#   memory and sandbox image. Conversations can no longer overwrite each other's files.
+# WORKSPACE_MODE=shared: all conversations use WORKSPACE_DIR (the old behaviour).
+#
+# The active workspace is a ContextVar set by the graph driver (graph.drive) while a conversation
+# runs, so several web sessions can work at the same time without sharing state.
+# ---------------------------------------------------------------------------
+_active_workspace: ContextVar[Path | None] = ContextVar("active_workspace", default=None)
+_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def current_workspace() -> Path:
+    """The workspace of the running conversation (or the shared default outside one)."""
+    return _active_workspace.get() or WORKSPACE
+
+
+@contextmanager
+def use_workspace(path: Path):
+    """Make `path` the active workspace inside the `with` block (this thread/task only)."""
+    token = _active_workspace.set(Path(path).resolve())
+    try:
+        yield
+    finally:
+        _active_workspace.reset(token)
+
+
+def workspace_mode() -> str:
+    mode = os.getenv("WORKSPACE_MODE", "session").strip().lower()
+    return mode if mode in ("session", "shared") else "session"
+
+
+def workspaces_root() -> Path:
+    """Parent directory of all per-conversation workspaces."""
+    return _resolve_dir("WORKSPACES_DIR", "./workspaces")
+
+
+def workspace_for(thread_id: str | None) -> Path:
+    """The workspace of one conversation (the shared workspace in `shared` mode)."""
+    if workspace_mode() == "shared" or not thread_id:
+        return WORKSPACE
+    safe = thread_id if _THREAD_ID_RE.match(thread_id) else hashlib.sha1(
+        thread_id.encode("utf-8", "replace")).hexdigest()[:24]
+    return workspaces_root() / safe
+
+
+def workspace_scope() -> str:
+    """Key used to group conversations in the history list: the shared workspace, or the
+    directory that holds all session workspaces."""
+    return str(WORKSPACE if workspace_mode() == "shared" else workspaces_root())
+
+
+def all_workspaces() -> list[Path]:
+    """Every workspace directory that exists (used to find sandbox images still in use)."""
+    roots = [WORKSPACE]
+    base = workspaces_root()
+    if base.is_dir():
+        roots += [p for p in base.iterdir() if p.is_dir()]
+    return [p for p in roots if p.is_dir()]
 
 
 def ensure_workspace(root: Path | None = None) -> Path:
     """Create the workspace, its .agent state directory and the reviews directory."""
-    root = root or WORKSPACE
+    root = root or current_workspace()
     (root / ".agent" / "reviews").mkdir(parents=True, exist_ok=True)
     return root
 
 
-ensure_workspace()
+ensure_workspace(WORKSPACE)
 
 
 class PathError(ValueError):
@@ -67,7 +150,7 @@ def safe_path(path: str | None = "") -> Path:
     path = path or ""
     if "\x00" in path:
         raise PathError("invalid path")
-    root = WORKSPACE.resolve()
+    root = current_workspace().resolve()
     candidate = Path(path).expanduser() if path.startswith("~") else Path(path)
     if not candidate.is_absolute():
         candidate = root / candidate
@@ -78,7 +161,7 @@ def safe_path(path: str | None = "") -> Path:
 
 
 def _rel(path: Path) -> str:
-    rel = path.relative_to(WORKSPACE.resolve()).as_posix()
+    rel = path.relative_to(current_workspace().resolve()).as_posix()
     return rel or "."
 
 
@@ -133,7 +216,14 @@ def _safe_tool(fn):
     return wrapper
 
 
+class Content(str):
+    """File or program content returned by a tool. It is never an error, even if the text itself
+    happens to start with "ERROR" (a log file, for example)."""
+
+
 def is_error_text(text: str) -> bool:
+    if isinstance(text, Content):
+        return False
     return str(text).lstrip().startswith("ERROR")
 
 
@@ -170,16 +260,33 @@ def list_files(path: str = "") -> str:
 
 @tool
 @_safe_tool
-def read_file(path: str) -> str:
-    """Read a UTF-8 text file from the workspace and return its contents."""
+def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
+    """Read a UTF-8 text file from the workspace. Large files are cut off at a size limit; for those
+    pass start_line / end_line (1-based, inclusive) to read just the part you need. Images and
+    other binary files cannot be read here: use view_image or inspect_file."""
     target = safe_path(path)
     if not _is_regular_file(target):  # also rejects FIFOs/devices that could block forever
         return f"ERROR: '{path}' is not a regular file"
     # Read a bounded amount: sandboxed code can create arbitrarily large files.
     text, truncated = _read_capped(target, MAX_READ_CHARS * 4)
+    if "\x00" in text[:4096]:
+        return (f"ERROR: '{path}' looks like a binary file. Use inspect_file for details, or "
+                f"view_image if it is an image.")
+    if start_line or end_line:
+        lines = text.splitlines(keepends=True)
+        first = max(1, start_line or 1)
+        last = min(len(lines), end_line) if end_line else len(lines)
+        if first > len(lines):
+            return f"ERROR: '{path}' has only {len(lines)} lines"
+        chunk = "".join(lines[first - 1:last])
+        note = f"[lines {first}-{last} of {len(lines)}{'+' if truncated else ''}]\n"
+        if len(chunk) > MAX_READ_CHARS:
+            chunk = chunk[:MAX_READ_CHARS] + "\n... [truncated: choose a smaller line range]"
+        return Content(note + chunk)
     if len(text) > MAX_READ_CHARS or truncated:
-        return text[:MAX_READ_CHARS] + "\n... [truncated: the file is larger than the read limit]"
-    return text
+        return Content(text[:MAX_READ_CHARS] + "\n... [truncated: the file is larger than the read "
+                       "limit; pass start_line/end_line to read a specific part]")
+    return Content(text)
 
 
 @tool
@@ -291,7 +398,7 @@ def search_text(query: str, path: str = "") -> str:
 def run_python_file(path: str) -> str:
     """Run a workspace .py file inside the Docker sandbox (no network, 512 MB, timeout).
     Returns exit code, stdout and stderr. Requires human approval."""
-    return str(sandbox.run_python_in_sandbox(WORKSPACE, path))
+    return str(sandbox.run_python_in_sandbox(current_workspace(), path))
 
 
 @tool
@@ -339,7 +446,7 @@ def run_tests(path: str = "") -> str:
     if path:
         rel = _rel(safe_path(path))
         args.append("." if rel == "." else "./" + rel)
-    result = sandbox.run_python_args_in_sandbox(WORKSPACE, args, timeout=sandbox.test_timeout())
+    result = sandbox.run_python_args_in_sandbox(current_workspace(), args, timeout=sandbox.test_timeout())
     text = str(result)
     if "No module named pytest" in text:
         text += "\nHint: pytest is not installed in the sandbox image. Call install_packages('pytest')."
@@ -351,7 +458,199 @@ def run_tests(path: str = "") -> str:
 def install_packages(packages: str) -> str:
     """Install pip packages by building a NEW Docker sandbox image from the current one.
     `packages` is space-separated requirements, e.g. 'pytest requests>=2.31'. Requires approval."""
-    return sandbox.install_packages_into_sandbox_image(WORKSPACE, packages.split())
+    result = sandbox.install_packages_into_sandbox_image(current_workspace(), packages.split())
+    if not is_error_text(result):  # the old image of this workspace is no longer referenced
+        try:
+            sandbox.prune_unused_images(all_workspaces())
+        except Exception:  # housekeeping must never turn a successful install into an error
+            pass
+    return result
+
+
+@tool
+@_safe_tool
+def run_python(code: str) -> str:
+    """Run a Python snippet inside the Docker sandbox (no network, resource limits, timeout) and
+    return its output. The working directory is the workspace, so the snippet can read and write
+    workspace files (put deliverables in out/) and start tools installed in the image, for example
+    `subprocess.run(["ffmpeg", ...])`. Prefer write_file + run_python_file for code you want to keep.
+    Requires human approval."""
+    return str(sandbox.run_code_in_sandbox(current_workspace(), code))
+
+
+# ---------------------------------------------------------------------------
+# Looking at binary files: images and media
+# ---------------------------------------------------------------------------
+MAX_IMAGE_BYTES = _env_int("MAX_IMAGE_BYTES", 2_000_000)
+_IMAGE_MIME = {"png": "image/png", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
+_MEDIA_KINDS = {"mp4", "webm", "mkv", "mov", "wav", "mp3", "ogg", "flac", "aac"}
+
+
+def sniff_type(head: bytes) -> str:
+    """File type from the first bytes ('png', 'jpeg', 'mp4', ..., 'text' or 'binary')."""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[4:8] == b"ftyp":
+        return "mov" if head[8:12] == b"qt  " else "mp4"
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
+        return "mp3"
+    if head[:5] == b"%PDF-":
+        return "pdf"
+    if head[:4] == b"PK\x03\x04":
+        return "zip"
+    return "binary" if b"\x00" in head[:4096] else "text"
+
+
+def image_size(kind: str, data: bytes) -> tuple[int, int] | None:
+    """(width, height) read from the header; no image library is used on untrusted data."""
+    try:
+        if kind == "png" and len(data) >= 24:
+            return struct.unpack(">II", data[16:24])
+        if kind == "gif" and len(data) >= 10:
+            return struct.unpack("<HH", data[6:10])
+        if kind == "jpeg":
+            i = 2
+            while i + 9 < len(data):
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                length = struct.unpack(">H", data[i + 2:i + 4])[0]
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    height, width = struct.unpack(">HH", data[i + 5:i + 9])
+                    return width, height
+                i += 2 + length
+    except (struct.error, IndexError):
+        return None
+    return None
+
+
+def load_image(path: str) -> tuple[str, bytes, str]:
+    """Validated image for view_image: (mime type, bytes, workspace-relative path).
+    Raises PathError / ValueError with a message the model can act on."""
+    target = safe_path(path)
+    if not _is_regular_file(target):
+        raise ValueError(f"'{path}' is not a regular file")
+    size = target.stat().st_size
+    if size > MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"'{path}' is {size // 1024} KB, over the {MAX_IMAGE_BYTES // 1024} KB limit. Make a "
+            f"smaller copy first (for example with Pillow: img.thumbnail((1280, 1280)); save as "
+            f"JPEG or PNG) and view that.")
+    data = target.read_bytes()
+    kind = sniff_type(data[:64])
+    if kind not in _IMAGE_MIME:
+        raise ValueError(f"'{path}' is not a PNG, JPEG, GIF or WebP image (looks like: {kind})")
+    return _IMAGE_MIME[kind], data, _rel(target)
+
+
+def image_content_block(mime: str, data: bytes) -> dict:
+    """A provider-neutral image block (LangChain converts data URIs for every provider)."""
+    return {"type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"}}
+
+
+@tool
+@_safe_tool
+def view_image(path: str) -> str:
+    """Look at an image file in the workspace (PNG, JPEG, GIF or WebP, up to about 2 MB): the image
+    is attached to the conversation so you can see it. Use it to check charts, rendered pages, video
+    frames and contact sheets. Keep images small (about 1280 px wide) to save cost; each image you
+    look at costs tokens, and only the most recent ones stay in context."""
+    try:
+        mime, data, rel = load_image(path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    size = image_size(mime.split("/")[1].replace("jpg", "jpeg"), data)
+    dims = f", {size[0]}x{size[1]} px" if size else ""
+    return f"Image attached: {rel} ({mime}{dims}, {len(data) // 1024} KB)"
+
+
+_FFPROBE_SNIPPET = """\
+import json, shutil, subprocess, sys
+if not shutil.which("ffprobe"):
+    print("ffprobe is not installed in the sandbox image (see Dockerfile.sandbox)")
+    sys.exit(0)
+r = subprocess.run(
+    ["ffprobe", "-v", "error", "-show_entries",
+     "format=format_name,duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,"
+     "r_frame_rate,sample_rate,channels", "-of", "json", sys.argv[1]],
+    capture_output=True, text=True, timeout=30)
+print((r.stdout or r.stderr).strip())
+"""
+
+
+@tool
+@_safe_tool
+def inspect_file(path: str) -> str:
+    """Describe any file in the workspace without reading all of it: size, detected type, image
+    dimensions, line count for text, and for audio/video the duration, codecs, resolution and
+    streams (via ffprobe in the sandbox). Use it before touching binary or media files."""
+    target = safe_path(path)
+    if not target.exists():
+        return f"ERROR: '{path}' does not exist"
+    if target.is_dir():
+        count = sum(1 for _ in target.iterdir())
+        return f"{_rel(target)}/ is a directory with {count} entries (use list_files)"
+    if not _is_regular_file(target):
+        return f"ERROR: '{path}' is not a regular file"
+    size = target.stat().st_size
+    with target.open("rb") as handle:
+        head = handle.read(65536)
+    kind = sniff_type(head)
+    lines = [f"{_rel(target)}: {kind}, {size:,} bytes"]
+    dims = image_size(kind, head)
+    if dims:
+        lines.append(f"image size: {dims[0]}x{dims[1]} px")
+    if kind == "text":
+        text, truncated = _read_capped(target, 2_000_000)
+        lines.append(f"lines: {text.count(chr(10)) + (1 if text and not text.endswith(chr(10)) else 0)}"
+                     + ("+ (file is larger than 2 MB)" if truncated else ""))
+    if kind in _MEDIA_KINDS:
+        result = sandbox.run_code_in_sandbox(
+            current_workspace(), _FFPROBE_SNIPPET, timeout=45,
+            script_args=[sandbox._container_path(current_workspace(), target)])
+        lines.append(("ffprobe: " + (result.stdout.strip() or result.stderr.strip() or "(no output)"))
+                     if result.ok else f"ffprobe not run: {result.error or result.stderr.strip() or 'failed'}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Deliverables: files the agent leaves in <workspace>/out/ are offered to the user
+# ---------------------------------------------------------------------------
+def output_files(root: Path | None = None, limit: int = 100) -> list[tuple[str, int]]:
+    """(path relative to the workspace, size in bytes) of regular files in out/, newest first."""
+    root = (root or current_workspace()).resolve()
+    base = root / OUTPUT_DIR
+    if not base.is_dir() or base.is_symlink():
+        return []
+    found: list[tuple[float, str, int]] = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if _is_regular_file(path):
+                info = path.lstat()
+                found.append((info.st_mtime, path.relative_to(root).as_posix(), info.st_size))
+    found.sort(reverse=True)
+    return [(rel, size) for _, rel, size in found[:limit]]
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +659,7 @@ def install_packages(packages: str) -> str:
 def _git_env() -> dict[str, str]:
     env = dict(os.environ)
     # Never walk up into a parent repository (the workspace may live inside another repo).
-    env["GIT_CEILING_DIRECTORIES"] = str(WORKSPACE.resolve().parent)
+    env["GIT_CEILING_DIRECTORIES"] = str(current_workspace().resolve().parent)
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -377,7 +676,7 @@ _SAFE_CONFIG_KEYS = frozenset({
 
 def _repo_problem() -> str | None:
     """None if there is no .git or it looks like a plain, trustworthy repository."""
-    gitdir = WORKSPACE.resolve() / ".git"
+    gitdir = current_workspace().resolve() / ".git"
     if not os.path.lexists(gitdir):
         return None
     if gitdir.is_symlink() or not gitdir.is_dir():
@@ -415,7 +714,7 @@ def _git(*args: str, timeout: int = 60, raw: bool = False) -> tuple[int, str]:
     cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
            "-c", "commit.gpgsign=false", *args]
     try:
-        proc = subprocess.run(cmd, cwd=WORKSPACE.resolve(), env=_git_env(), capture_output=True,
+        proc = subprocess.run(cmd, cwd=current_workspace().resolve(), env=_git_env(), capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except FileNotFoundError:
         return 127, "git is not installed"
@@ -428,7 +727,7 @@ def _git(*args: str, timeout: int = 60, raw: bool = False) -> tuple[int, str]:
 
 def _is_repo() -> bool:
     code, out = _git("rev-parse", "--show-toplevel")
-    return code == 0 and Path(out).resolve() == WORKSPACE.resolve()
+    return code == 0 and Path(out).resolve() == current_workspace().resolve()
 
 
 def _has_head() -> bool:
@@ -459,7 +758,7 @@ def git_init() -> str:
     code, out = _git("init")
     if code != 0:
         return f"ERROR: {out}"
-    gitignore = WORKSPACE / ".gitignore"
+    gitignore = current_workspace() / ".gitignore"
     if not gitignore.exists():
         gitignore.write_text(".agent/\n__pycache__/\n*.pyc\n.pytest_cache/\n", encoding="utf-8")
     return out or "Initialised repository."
@@ -548,7 +847,7 @@ def git_log() -> str:
 # ---------------------------------------------------------------------------
 def _agent_file(name: str) -> Path:
     ensure_workspace()
-    return WORKSPACE / ".agent" / name
+    return current_workspace() / ".agent" / name
 
 
 @tool
@@ -636,7 +935,7 @@ def tree_fingerprint() -> str:
     code, listing = _git("ls-files", "-z", "--cached", "--others", "--exclude-standard", raw=True)
     if code != 0:
         return ""
-    root = WORKSPACE.resolve()
+    root = current_workspace().resolve()
     digest = hashlib.sha256()
     for name in sorted({n for n in listing.split("\0") if n}):
         if name == ".agent" or name.startswith(".agent/"):
@@ -712,6 +1011,7 @@ def review_changes() -> str:
                     [SystemMessage(content=REVIEW_PROMPT), HumanMessage(content=request)])
             except Exception as exc:  # network/API problems must not crash the graph
                 return f"ERROR: review model call failed: {type(exc).__name__}: {exc}"
+            usage.record_extra(str(current_workspace()), getattr(reply, "usage_metadata", None))
             outputs.append(content_to_text(reply.content).strip() or "(empty review)")
         if len(outputs) == 1:
             review = outputs[0]
@@ -787,7 +1087,7 @@ TOOLS = [
     # file tools
     list_files, read_file, write_file, edit_file, create_directory, search_text,
     # execution tools
-    run_python_file, check_python_syntax, run_tests, install_packages,
+    run_python_file, run_python, check_python_syntax, run_tests, install_packages, inspect_file,
     # git tools
     git_init, git_status, git_add, git_commit, git_diff, git_log,
     # planning and memory tools
@@ -795,8 +1095,10 @@ TOOLS = [
     # review tool
     review_changes,
 ]
-# TOOLS is what the classic react agent gets. start_build exists only in the auto agent.
-ALL_TOOLS = [*TOOLS, start_build]
+# TOOLS is what the classic react agent gets. start_build exists only in the auto agent, and so
+# does view_image: its image has to be attached by the pipeline's tools node (a plain ToolNode only
+# returns text).
+ALL_TOOLS = [*TOOLS, start_build, view_image]
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
 
 # ---------------------------------------------------------------------------
@@ -805,12 +1107,12 @@ TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
 # Dangerous = changes project files, executes code, installs software or records history.
 DANGEROUS_TOOLS = frozenset({
     "write_file", "edit_file", "create_directory",
-    "run_python_file", "run_tests", "install_packages",
+    "run_python_file", "run_python", "run_tests", "install_packages",
     "git_commit",
 })
 # Safe = reads, listings, parsing, staging, and the agent's own notes in .agent/.
 SAFE_TOOLS = frozenset({
-    "list_files", "read_file", "search_text", "check_python_syntax",
+    "list_files", "read_file", "search_text", "check_python_syntax", "inspect_file", "view_image",
     "git_init", "git_status", "git_add", "git_diff", "git_log",
     "update_plan", "update_todo", "save_memory", "read_agent_state", "review_changes",
     "start_build",  # a handoff only: it starts the build stages, whose dangerous tools still ask
@@ -822,13 +1124,16 @@ assert not DANGEROUS_TOOLS & SAFE_TOOLS
 def approval_mode() -> str:
     """'dangerous' (default): only dangerous tools need approval. 'all': every tool does."""
     mode = os.getenv("APPROVAL_MODE", "dangerous").strip().lower()
-    return mode if mode in ("dangerous", "all") else "dangerous"
+    return mode if mode in ("dangerous", "all", "none") else "dangerous"
 
 
 def requires_approval(tool_name: str) -> bool:
     """True if a call to `tool_name` must be approved by a human.
     Unknown tools always require approval (fail closed)."""
-    if approval_mode() == "all":
+    mode = approval_mode()
+    if mode == "none":
+        return False
+    if mode == "all":
         return True
     return tool_name not in SAFE_TOOLS
 
@@ -843,7 +1148,8 @@ STAGE_TOOLS: dict[str, tuple[str, ...]] = {
     # Conversation: can look at everything, run code/tests (with approval) and keep notes, but
     # cannot change project files or commit. Changes go through start_build.
     "chat": ("read_agent_state", "list_files", "read_file", "search_text", "check_python_syntax",
-             "run_python_file", "run_tests", "git_status", "git_diff", "git_log",
+             "inspect_file", "view_image", "run_python_file", "run_python", "run_tests",
+             "git_status", "git_diff", "git_log",
              "update_plan", "update_todo", "save_memory", "start_build"),
     # Understand and plan; cannot touch project files or run code.
     "planner": ("read_agent_state", "list_files", "read_file", "search_text",
@@ -851,13 +1157,13 @@ STAGE_TOOLS: dict[str, tuple[str, ...]] = {
     # The only stage that can change files, run code or install packages. Cannot review or commit.
     "coder": ("read_agent_state", "list_files", "read_file", "search_text",
               "write_file", "edit_file", "create_directory", "check_python_syntax",
-              "run_python_file", "run_tests", "install_packages", "update_todo",
-              "git_status", "git_diff", "save_memory"),
+              "inspect_file", "view_image", "run_python_file", "run_python", "run_tests",
+              "install_packages", "update_todo", "git_status", "git_diff", "save_memory"),
     # Read-only judge: no write/edit tools at all.
     # git_init is allowed only so review_changes can work on a brand-new workspace.
     "reviewer": ("read_agent_state", "list_files", "read_file", "search_text",
-                 "check_python_syntax", "run_tests", "git_init", "git_status", "git_diff",
-                 "git_log", "review_changes"),
+                 "check_python_syntax", "inspect_file", "view_image", "run_tests", "git_init",
+                 "git_status", "git_diff", "git_log", "review_changes"),
     # The only stage that can stage and commit.
     "committer": ("read_agent_state", "git_init", "git_status", "git_diff", "git_log",
                   "git_add", "git_commit", "save_memory"),
@@ -868,9 +1174,9 @@ assert "git_commit" not in sum((STAGE_TOOLS[s] for s in ("chat", "planner", "cod
 assert not {"write_file", "edit_file", "create_directory", "install_packages", "git_add"} & set(STAGE_TOOLS["chat"])
 
 
-def workspace_top_level(limit: int = 50) -> list[tuple[str, bool]]:
+def workspace_top_level(limit: int = 50, root: Path | None = None) -> list[tuple[str, bool]]:
     """Top-level workspace entries as (name, is_dir), directories first (for the UI sidebar)."""
-    ensure_workspace()
-    items = [(p.name, p.is_dir()) for p in WORKSPACE.iterdir() if p.name not in IGNORED_DIRS]
+    root = ensure_workspace(root)
+    items = [(p.name, p.is_dir()) for p in root.iterdir() if p.name not in IGNORED_DIRS]
     items.sort(key=lambda item: (not item[1], item[0].lower()))
     return items[:limit]

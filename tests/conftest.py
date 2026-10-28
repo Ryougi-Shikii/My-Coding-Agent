@@ -8,8 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent import graph as graph_module
-from agent import history
-from agent import sandbox
+from agent import history, sandbox
 from agent import tools as tools_module
 from tests.fakes import ScriptedChatModel
 
@@ -35,6 +34,9 @@ def isolated_history(tmp_path, monkeypatch):
     """Every test gets its own conversation database: tests never touch real saved chats."""
     monkeypatch.setenv("CONVERSATION_DB", str(tmp_path / "conversations.sqlite"))
     monkeypatch.delenv("AGENT_MODE", raising=False)
+    # Most tests use the single `ws` fixture workspace; per-session workspaces have their own tests.
+    monkeypatch.setenv("WORKSPACE_MODE", "shared")
+    monkeypatch.delenv("RUN_TOKEN_BUDGET", raising=False)
     history.reset()
     graph_module._graphs.clear()
     yield

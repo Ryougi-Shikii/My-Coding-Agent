@@ -9,9 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import symlink
-
 from agent import sandbox as sb
+from tests.conftest import symlink
 
 
 @pytest.fixture
@@ -242,10 +241,11 @@ class TestInstallPackages:
         assert "BASE_IMAGE=python:3.12-slim" in cmd
         tag = cmd[cmd.index("-t") + 1]
         assert tag.startswith("lca-sandbox:") and tag in msg
-        assert seen["files"] == ["Dockerfile", "install.py", "packages.json"]
+        assert seen["files"] == ["Dockerfile", "install.py", "packages.json", "source_builds.json"]
         assert seen["packages"] == ["pytest", "requests>=2.0"]
         assert "FROM ${BASE_IMAGE}" in seen["dockerfile"] and "install.py" in seen["dockerfile"]
         assert "shell=True" not in seen["install"] and "check_call" in seen["install"]
+        assert "--only-binary=:all:" in seen["install"]  # no setup.py runs during the build
         # The new tag becomes the active image for every later run...
         assert (root / ".agent" / "sandbox_image.txt").read_text().strip() == tag
         assert sb.get_sandbox_image(root) == tag

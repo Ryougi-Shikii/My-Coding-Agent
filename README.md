@@ -1,14 +1,15 @@
 # LangGraph Coding Agent
 
 An autonomous coding agent built with **LangGraph**, available as a **Streamlit web app** (`app.py`)
-and as a **command-line tool** (`cli.py`). It can create, read, edit, list and search files, check
-syntax, run Python and tests in a locked-down **Docker sandbox**, install packages (by building a
+and as a **command-line tool** (`cli.py`). It can create, read, edit, list and search files, look at images and inspect media files, check
+syntax, run Python snippets, scripts and tests in a locked-down **Docker sandbox**, install packages (by building a
 new sandbox image), use Git, keep a plan / todo list / persistent memory, and review its own changes.
 
 It works with several LLM providers (OpenAI, Anthropic, Google Gemini, xAI/Grok) through
 `init_chat_model`, chosen with environment variables.
 
-The agent only ever works inside the `workspace/` directory.
+The agent only ever works inside its workspace: by default **one directory per conversation** under `workspaces/`
+(see *Workspaces*).
 
 ## Three modes
 
@@ -51,7 +52,7 @@ Resuming shows the end of the conversation again; if it was waiting for an appro
 
 | Needs your approval | Runs automatically |
 |---|---|
-| `write_file`, `edit_file`, `create_directory`, `run_python_file`, `run_tests`, `install_packages`, `git_commit` | `list_files`, `read_file`, `search_text`, `check_python_syntax`, `git_init`, `git_status`, `git_add`, `git_diff`, `git_log`, `read_agent_state`, `update_plan`, `update_todo`, `save_memory`, `review_changes` |
+| `write_file`, `edit_file`, `create_directory`, `run_python_file`, `run_python`, `run_tests`, `install_packages`, `git_commit` | `list_files`, `read_file`, `search_text`, `check_python_syntax`, `inspect_file`, `view_image`, `git_init`, `git_status`, `git_add`, `git_diff`, `git_log`, `read_agent_state`, `update_plan`, `update_todo`, `save_memory`, `review_changes` |
 
 * Nothing dangerous runs before you click **Approve** (web) or answer `y` (CLI). **Reject** tells
   the agent its call was refused (it receives a `ToolMessage` saying so) and it must change approach.
@@ -88,6 +89,45 @@ Resuming shows the end of the conversation again; if it was waiting for an appro
 What is **not** enforced by the graph: that the coder actually ran tests, and the quality of the review itself
 (it is an LLM judgement, so treat it as a second opinion).
 
+## Workspaces: one per conversation
+
+`WORKSPACE_MODE=session` (default): every conversation gets its own directory `workspaces/<conversation id>/`
+with its own git repository, plan / todo / memory and sandbox image, so two conversations (or two browser
+tabs) can never overwrite each other's files. Reopening a conversation reopens its workspace. Deleting a
+conversation does **not** delete its directory (your code is in there); remove it by hand when you are done.
+`WORKSPACE_MODE=shared` keeps the old behaviour: everything happens in `WORKSPACE_DIR` (default `./workspace`).
+
+## Context and cost control
+
+An agent loop re-sends the whole conversation on every step, so cost used to grow roughly with the square of
+the number of steps. Now:
+
+* **Stage isolation.** Each build stage sees a short briefing (task, hand-over note, saved plan and todo) plus
+  only its own messages, not the transcripts of earlier stages. The files in `.agent/` carry the rest.
+* **Compaction.** Older tool results are shortened (head + tail), and only the last 2 images stay in context.
+  The boundary moves in steps so the start of the conversation stays identical between calls and provider
+  prompt caches keep working. The stored conversation is never changed.
+* **Size cap.** What the chat sends is capped (`CONTEXT_MAX_CHARS`); finished builds collapse to their outcome.
+* **Cheaper reads.** `read_file` takes `start_line` / `end_line`, and the default read limit is 30,000 characters.
+* **Token budget.** `RUN_TOKEN_BUDGET` (default 300,000, 0 = unlimited) caps one user message across all stages;
+  the run then stops and says so. Usage is shown in the web sidebar and in `/status`.
+
+On a synthetic session (planner + 14 large file reads in the coder + review + commit) this sent about 70% fewer
+characters to the model than sending the full transcript every time. Real savings depend on your tasks. (The
+token budget applies to `auto` and `pipeline` mode; `react` mode gets the size cap and compaction only.)
+
+## Files, images and media
+
+* `view_image(path)` shows the agent an image (PNG/JPEG/GIF/WebP up to 2 MB) so it can check charts, pages or video
+  frames. Images are validated by their header and never decoded on your machine.
+* `inspect_file(path)` describes any file (type, size, image dimensions, line count, and duration / codecs for
+  audio and video through `ffprobe` in the sandbox).
+* `run_python(code)` runs a snippet in the sandbox (code travels on stdin; nothing is written to the workspace).
+* Files the agent puts in `out/` are offered as downloads in the web sidebar (`/outputs` in the CLI).
+* For media work build the richer sandbox image: `docker build -f Dockerfile.sandbox -t my-coding-sandbox:latest .`
+  and set `SANDBOX_IMAGE=my-coding-sandbox:latest` (ffmpeg, Pillow, OpenCV, numpy, scipy, fonts). Raise
+  `SANDBOX_MEMORY` / `SANDBOX_CPUS` for heavy jobs.
+
 ## Setup
 
 Requires Python 3.10+ and Docker.
@@ -100,9 +140,9 @@ cp .env.example .env        # then edit .env
 ### Configure `.env`
 
 ```
-LLM_PROVIDER=google_genai        # openai | anthropic | google_genai | xai
-MODEL_NAME=gemini-2.0-flash      # optional: each provider has a default
-GOOGLE_API_KEY=...               # the key for the provider you chose
+LLM_PROVIDER=google_genai             # openai | anthropic | google_genai | xai
+MODEL_NAME=gemini-3.5-flash-lite      # optional: each provider has a default
+GOOGLE_API_KEY=...                    # the key for the provider you chose
 ```
 
 For OpenAI / Anthropic set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`. For xAI install the optional package
@@ -134,13 +174,16 @@ In the CLI, type `/help` for commands (`/state`, `/status`, `/new`, `/list`, `/r
 
 * **Workspace only.** Every path is resolved (symlinks included) and must stay inside `WORKSPACE_DIR`
   (default `./workspace`, relative to the project root). `.git/` and `.agent/sandbox_image.txt` cannot be written by file tools.
-* **Docker-only execution by default.** Code runs with `--network none`, 512 MB RAM, 1 CPU, 256 processes, all capabilities dropped,
+* **Docker-only execution by default.** Code runs with `--network none`, 512 MB RAM, 1 CPU, 256 processes (the limits are
+  configurable: `SANDBOX_MEMORY`, `SANDBOX_CPUS`, `SANDBOX_PIDS`, `SANDBOX_TMP_MB`; the network is always off), all capabilities dropped,
   `no-new-privileges`, read-only root filesystem, a 128 MB `/tmp`, a non-root user, and a timeout
   (a timed-out container is removed). `.git` and `.agent` are mounted read-only inside the sandbox.
   If you run as root, the container uses user `65534`; set `SANDBOX_USER=uid:gid` to change it.
   If Docker is not available, nothing is executed. `ALLOW_UNSAFE_LOCAL_EXECUTION=true` allows running directly on your machine
   (**not sandboxed**, minimal environment so API keys are not passed on); only use it if you accept that risk.
-* **Package installation builds a new sandbox image.** `install_packages` validates each requirement (plain names, optional extras and version
+* **Package installation builds a new sandbox image** (wheels only by default: `--only-binary=:all:`, so no package can
+  run its own build script; `ALLOW_SOURCE_BUILDS=true` lifts that, `PACKAGE_ALLOWLIST=numpy,pandas,...` restricts which packages
+  may be installed, and images no workspace refers to any more are removed after each install). `install_packages` validates each requirement (plain names, optional extras and version
   specifiers only), builds a new image `FROM` the current sandbox image in a temporary build context (`Dockerfile`, `packages.json`, `install.py`; package
   strings never go through a shell), then records the new tag in `workspace/.agent/sandbox_image.txt`. All later runs use that image.
   Packages are never installed on your machine. Note that the build itself has network access to PyPI.
@@ -166,15 +209,37 @@ app.py            Streamlit front end
 cli.py            command-line front end
 agent/llm.py      get_chat_model(): init_chat_model, provider/model from env, cached
 agent/prompts.py  system prompt and per-stage prompts
+agent/context.py  what each model call is sent: stage isolation, compaction, size cap
+agent/usage.py   token usage and the per-request budget
 agent/sandbox.py  Docker execution and image building
 agent/tools.py    workspace-confined tools, approval policy, per-stage tool lists
 agent/graph.py    react / pipeline / auto graphs, shared run/approval driver
 agent/history.py  saved conversations (SQLite checkpointer + index)
-workspace/        the only directory the agent should modify
+workspaces/       one directory per conversation (workspace/ in shared mode): the only place the agent writes
+evals/            real-model eval tasks (python -m evals.run)
 tests/            pytest suite (no API key or Docker needed)
+Dockerfile.sandbox  sandbox image with ffmpeg, Pillow, OpenCV, numpy, scipy, fonts
 ```
 
+## Evals (does the agent actually work?)
+
+The mocked tests prove the machinery; evals measure the model. `evals/tasks.py` has small jobs with an objective
+check (write a module, fix a bug, extend a class, write tests, answer a question *without* touching files, refuse to
+leave the workspace, a CSV report, a WAV file). They run against your real model and Docker, in throw-away workspaces:
+
+```bash
+python -m evals.run --list
+python -m evals.run --only fizzbuzz,fix_bug      # start small: this costs tokens
+python -m evals.run --mode auto --budget 150000
+```
+
+Results (pass/fail, tokens, time) are saved to `evals/results/*.json`, so you can compare runs before and after
+changing a prompt, a model or the pipeline. Build `Dockerfile.sandbox` first so tasks that write tests have pytest.
+
 ## Tests
+
+CI (`.github/workflows/ci.yml`) runs `ruff` and the suite on every push.
+
 
 ```bash
 pip install pytest

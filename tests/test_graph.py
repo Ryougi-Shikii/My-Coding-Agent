@@ -74,7 +74,9 @@ def happy_script():
 
 
 def status_of(graph, config):
-    return g.get_run_status(graph, config)
+    status = g.get_run_status(graph, config)
+    status.pop("usage", None)  # token counts have their own tests
+    return status
 
 
 # =========================================================================== pipeline happy path

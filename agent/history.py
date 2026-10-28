@@ -142,21 +142,31 @@ def record(thread_id: str, mode: str, workspace: str, first_message: str | None 
             conn.close()
 
 
+def _in_scope(row_workspace: str, scope: str) -> bool:
+    """A conversation belongs to `scope` if its workspace IS the scope (shared mode) or lives
+    directly inside it (one directory per conversation)."""
+    if row_workspace == scope:
+        return True
+    try:
+        return Path(row_workspace).parent == Path(scope)
+    except (OSError, ValueError):
+        return False
+
+
 def list_conversations(workspace: str, limit: int = 50) -> list[dict]:
-    """Most recently used first."""
+    """Most recently used first. `workspace` is the scope (see tools.workspace_scope)."""
     if not persistent():
         with _lock:
-            rows = [dict(r) for r in _memory_index.values() if r["workspace"] == workspace]
+            rows = [dict(r) for r in _memory_index.values() if _in_scope(r["workspace"], workspace)]
         return sorted(rows, key=lambda r: r["updated_at"], reverse=True)[:limit]
     with _lock:
         conn = _connect()
         try:
-            rows = conn.execute(
-                "SELECT * FROM conversations WHERE workspace = ? ORDER BY updated_at DESC LIMIT ?",
-                (workspace, limit)).fetchall()
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM conversations ORDER BY updated_at DESC").fetchall()]
         finally:
             conn.close()
-    return [dict(r) for r in rows]
+    return [r for r in rows if _in_scope(r["workspace"], workspace)][:limit]
 
 
 def get_conversation(thread_id: str) -> dict | None:

@@ -1,34 +1,56 @@
-# Base sandbox image with Python 3.12 slim
+# Sandbox image for the coding agent: Python 3.12 + the libraries and media tools the agent most
+# often needs, so it never has to rebuild the image just to get started.
+#
+# What is inside
+#   - Python: pytest, pydantic, numpy, scipy, pandas, matplotlib, Pillow, OpenCV (headless)
+#   - Media:  ffmpeg + ffprobe (libx264, libfreetype, libass, ...), SoX
+#   - Fonts:  DejaVu, Liberation, Noto Color Emoji (so text and emoji can be drawn onto images/video)
+#
+# Build once (from the project root):
+#   docker build -f Dockerfile.sandbox -t my-coding-sandbox:latest .
+# Then set in .env:
+#   SANDBOX_IMAGE=my-coding-sandbox:latest
+# The image is a few hundred MB larger than python:3.12-slim because of ffmpeg and the fonts. For
+# video/ML jobs raise the container limits in .env, e.g. SANDBOX_MEMORY=2g and SANDBOX_CPUS=2.
+#
+# Security notes: the agent runs this image with --network none, a read-only root filesystem, all
+# capabilities dropped and a non-root user (see agent/sandbox.py), so nothing here needs network
+# access at run time. Everything is installed at BUILD time only. Wheels only (--only-binary), so
+# no package can run its own build script while the image is built.
+
 FROM python:3.12-slim
 
-# Prevent pip from writing cache files to keep image size small
 ENV PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # The root filesystem is read-only at run time; /tmp is the only writable scratch space.
+    HOME=/tmp \
+    MPLBACKEND=Agg \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    XDG_CACHE_HOME=/tmp/.cache
 
-# Install common libraries ahead of time so the agent never needs slow docker builds
-RUN pip install \
-    pytest \
-    pytest-cov \
-    pydantic \
-    numpy \
-    pandas \
-    matplotlib
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ffmpeg \
+      sox \
+      libglib2.0-0 \
+      fontconfig \
+      fonts-dejavu-core \
+      fonts-liberation \
+      fonts-noto-color-emoji \
+ && fc-cache -f \
+ && rm -rf /var/lib/apt/lists/*
 
-# ==============================================================================
-# HOW TO BUILD AND USE THIS SANDBOX IMAGE:
-# ==============================================================================
-#
-# Step 2: Build the image with Docker
-#   Open PowerShell/terminal in this project root and run:
-#     docker build -f Dockerfile.sandbox -t my-coding-sandbox:latest .
-#
-# Step 3: Tell the agent to use your new image
-#   Open your .env file and set:
-#     SANDBOX_IMAGE=my-coding-sandbox:latest
-#
-# Step 4: Verify it in the app
-#   Run the app:
-#     streamlit run app.py
-#   Check the left sidebar under "Sandbox":
-#     It should show "Image: my-coding-sandbox:latest" and "Docker available".
-# ==============================================================================
+RUN pip install --only-binary=:all: \
+      pytest \
+      pytest-cov \
+      pydantic \
+      numpy \
+      scipy \
+      pandas \
+      matplotlib \
+      pillow \
+      opencv-python-headless
+
+WORKDIR /workspace

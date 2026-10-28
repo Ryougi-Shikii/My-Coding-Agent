@@ -1,11 +1,12 @@
-streamlit
-python-dotenv
-langgraph
-langgraph-checkpoint-sqlite
-langchain
-langchain-openai
-langchain-anthropic
-langchain-google-genai
-langgraph-checkpoint-sqlite
+# Version ranges: tested with the versions noted in each comment. Pin exact versions in your own
+# lock file (pip freeze > requirements.lock) if you need fully reproducible installs.
+streamlit>=1.40,<2          # tested 1.66
+python-dotenv>=1.0,<2
+langgraph>=1.0,<2           # tested 1.2
+langgraph-checkpoint-sqlite>=3.0,<4
+langchain>=1.0,<2           # tested 1.4
+langchain-openai>=1.0,<2
+langchain-anthropic>=1.0,<2
+langchain-google-genai>=3.0,<5
 # Optional: xAI / Grok support (set LLM_PROVIDER=xai)
 # langchain-xai

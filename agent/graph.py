@@ -35,11 +35,12 @@ import os
 import warnings
 from typing import Any, Iterator
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import create_react_agent
 
-from agent import history
+from agent import context as context_module
+from agent import history, usage
 from agent import tools as tools_module
 from agent.llm import content_to_text, get_chat_model
 from agent.prompts import (
@@ -93,7 +94,11 @@ _graphs: dict[tuple[str, str], Any] = {}
 # react mode
 # ---------------------------------------------------------------------------
 def _build_react_graph(model, checkpointer):
-    prompt = render_prompt(SYSTEM_PROMPT, tools_module.WORKSPACE)
+    def prompt(state):
+        """System prompt for the CURRENT conversation's workspace + a size-capped history."""
+        system = render_prompt(SYSTEM_PROMPT, tools_module.current_workspace())
+        return context_module.react_messages(state["messages"], system)
+
     common = dict(checkpointer=checkpointer, interrupt_before=["tools"])
     # LangGraph renamed the system-prompt argument across versions: try prompt=, then
     # state_modifier=, then give up on attaching a prompt.
@@ -123,6 +128,8 @@ class PipelineState(MessagesState):
     status: str         # "" while running; committed | reviewed | coded | no_changes |
                         # stalled | review_failed
     reviewed_tree: str  # fingerprint of the exact tree the reviewer approved ("" before approval)
+    task: str           # the task of the current build (stages do not see each other's transcripts)
+    halted: bool        # the token budget of this request was reached
 
 
 def _window(state: PipelineState) -> list:
@@ -202,11 +209,14 @@ def make_intake(chat: bool):
     """Entry node: every new user message starts here."""
 
     def intake(state: PipelineState) -> dict:
-        update = {"revisions": 0, "nudges": 0, "builds": 0, "status": "", "reviewed_tree": ""}
+        update = {"revisions": 0, "nudges": 0, "builds": 0, "status": "", "reviewed_tree": "",
+                  "halted": False}
         if chat:
-            return {**update, "stage": CHAT_STAGE, "steps": [], "after": "chat"}
+            return {**update, "stage": CHAT_STAGE, "steps": [], "after": "chat", "task": ""}
+        last = state["messages"][-1] if state["messages"] else None
+        task = content_to_text(last.content) if isinstance(last, HumanMessage) else ""
         return {**update, "stage": "planner", "steps": list(STAGES), "after": "done",
-                "stage_start": max(len(state["messages"]) - 1, 0)}
+                "task": task[:6000], "stage_start": max(len(state["messages"]) - 1, 0)}
 
     return intake
 
@@ -245,7 +255,7 @@ def handoff(state: PipelineState) -> dict:
     note = HumanMessage(content="[pipeline] " + BUILD_START[first].replace("{task}", task[:4000]))
     return {"messages": [result, note], "stage": first, "steps": steps,
             "stage_start": len(messages) + 2, "revisions": 0, "nudges": 0, "status": "",
-            "reviewed_tree": "", "builds": builds + 1}
+            "reviewed_tree": "", "builds": builds + 1, "task": task[:6000]}
 
 
 def advance(state: PipelineState) -> dict:
@@ -254,6 +264,10 @@ def advance(state: PipelineState) -> dict:
     window = _window(state)
     done = _succeeded(window)
     chosen = state.get("steps") or list(STAGES)
+
+    if state.get("halted"):
+        return _conclude(state, "stalled", "Stopped: the token budget for this request was reached "
+                         "(RUN_TOKEN_BUDGET), so no further steps were run.")
 
     if stage == "planner":
         missing = {"update_plan", "update_todo"} - done
@@ -338,6 +352,24 @@ def route_after_model(state: PipelineState) -> str:
 COMMIT_GUARDED_TOOLS = frozenset({"git_add", "git_commit"})
 
 
+def _image_messages(calls: list[dict], results: list[ToolMessage]) -> list[HumanMessage]:
+    """view_image answers with text; the picture itself is attached as a user message after the
+    tool results (tool results cannot carry images on every provider)."""
+    extra: list[HumanMessage] = []
+    for call, result in zip(calls, results):
+        if call["name"] != "view_image" or result.status == "error":
+            continue
+        try:
+            mime, data, rel = tools_module.load_image((call.get("args") or {}).get("path", ""))
+        except (ValueError, tools_module.PathError, OSError):
+            continue
+        extra.append(HumanMessage(content=[
+            {"type": "text", "text": f"{context_module.PIPELINE_PREFIX} Image from view_image: {rel}"},
+            tools_module.image_content_block(mime, data),
+        ]))
+    return extra
+
+
 def tools_node(state: PipelineState) -> dict:
     """Runs the tool calls of the last AI message, enforcing the stage allow-list."""
     stage = state["stage"]
@@ -357,7 +389,7 @@ def tools_node(state: PipelineState) -> dict:
                       "(or nothing was approved). Nothing was staged or committed."))
         else:
             results.append(run_tool_call(call))
-    return {"messages": results}
+    return {"messages": results + _image_messages(state["messages"][-1].tool_calls, results)}
 
 
 def _tag(reply, stage: str):
@@ -370,16 +402,23 @@ def _tag(reply, stage: str):
 
 
 def _build_pipeline_graph(model, checkpointer, chat: bool):
-    workspace = tools_module.WORKSPACE
-    prompts = {s: render_prompt(STAGE_PROMPTS[s], workspace) for s in STAGES}
-    prompts[CHAT_STAGE] = render_prompt(CHAT_PROMPT, workspace)
+    templates = {s: STAGE_PROMPTS[s] for s in STAGES}
+    templates[CHAT_STAGE] = CHAT_PROMPT
     stages = ((CHAT_STAGE,) if chat else ()) + STAGES
     bound = {s: model.bind_tools([TOOLS_BY_NAME[n] for n in STAGE_TOOLS[s]]) for s in stages}
 
     def make_stage_node(stage: str):
         def run(state: PipelineState) -> dict:
-            reply = bound[stage].invoke([SystemMessage(content=prompts[stage]),
-                                         *state["messages"]])
+            exceeded, used, budget = usage.over_budget(state["messages"])
+            if exceeded:
+                note = AIMessage(content=f"[budget] Stopped: this request has used {used:,} tokens "
+                                         f"(limit {budget:,}, RUN_TOKEN_BUDGET). Send a smaller or "
+                                         f"more specific request, or raise the limit.")
+                return {"messages": [_tag(note, stage)], "halted": True}
+            workspace = tools_module.current_workspace()
+            system = render_prompt(templates[stage], workspace)
+            reply = bound[stage].invoke(
+                context_module.build_messages(state, stage, system, workspace))
             return {"messages": [_tag(reply, stage)]}
         run.__name__ = stage
         return run
@@ -541,9 +580,11 @@ def get_run_status(graph, config) -> dict:
     """Pipeline progress for the UI (react mode returns stage=None)."""
     snapshot = graph.get_state(config)
     values = snapshot.values or {}
+    workspace = str(tools_module.workspace_for((config.get("configurable") or {}).get("thread_id")))
     return {"stage": values.get("stage"), "status": values.get("status", ""),
             "revisions": values.get("revisions", 0), "steps": values.get("steps") or [],
-            "waiting": bool(snapshot.next)}
+            "waiting": bool(snapshot.next),
+            "usage": usage.summary(values.get("messages") or [], workspace)}
 
 
 def _remember(config, user_text: str) -> None:
@@ -551,9 +592,23 @@ def _remember(config, user_text: str) -> None:
     try:
         configurable = config.get("configurable", {})
         history.record(configurable["thread_id"], configurable.get("mode") or default_mode(),
-                       str(tools_module.WORKSPACE), user_text)
+                       str(tools_module.workspace_for(configurable["thread_id"])), user_text)
     except Exception:
         pass
+
+
+def _in_workspace(workspace, iterator) -> Iterator[Any]:
+    """Iterate `iterator` with `workspace` active only while the graph is actually running (the
+    ContextVar is set around each step, so it never leaks into the caller's own code between
+    events, and LangGraph copies it into the worker threads that run the nodes)."""
+    iterator = iter(iterator)
+    while True:
+        with tools_module.use_workspace(workspace):
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+        yield item
 
 
 def drive(graph, config, user_text: str | None = None) -> Iterator[dict]:
@@ -565,11 +620,14 @@ def drive(graph, config, user_text: str | None = None) -> Iterator[dict]:
     After the generator ends, call pending_tool_calls() to see whether approval is needed.
     """
     graph_input: Any = None
+    workspace = tools_module.workspace_for(config.get("configurable", {}).get("thread_id"))
+    tools_module.ensure_workspace(workspace)
     if user_text is not None:
         _remember(config, user_text)
         graph_input = {"messages": [HumanMessage(content=user_text)]}
     while True:
-        for chunk in graph.stream(graph_input, config, stream_mode="updates"):
+        for chunk in _in_workspace(workspace, graph.stream(graph_input, config,
+                                                           stream_mode="updates")):
             yield from _events_from_chunk(chunk)
         pending = pending_tool_calls(graph, config)
         if pending and not needs_human(pending):

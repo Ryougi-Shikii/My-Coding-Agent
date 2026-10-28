@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from agent import graph as g
 import cli
+from agent import graph as g
 from tests.conftest import git
 from tests.fakes import ai, call
-from tests.test_graph import committer_steps, happy_script, planner_steps
+from tests.test_graph import happy_script, planner_steps
 
 
 class Terminal:

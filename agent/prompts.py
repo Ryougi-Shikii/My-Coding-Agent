@@ -16,7 +16,22 @@ Safety rules (always apply):
 - Some tools need human approval (writing/editing files, running code or tests, installing
   packages, git commit). Read-only tools run automatically. If a tool call is rejected, do NOT
   retry it unchanged: change your approach, or explain what you need and ask the user.
-- Code runs only in a locked-down Docker sandbox with no network access."""
+- Code runs only in a locked-down Docker sandbox with no network access.
+- Context costs money. Read only what you need: for big files pass start_line/end_line to read_file,
+  use search_text to find the right place first, and do not re-read files you already have."""
+
+_MEDIA_NOTES = """\
+Files and media (when the task is not plain code):
+- Put finished deliverables (videos, images, reports, data files) in the `out/` folder; the user can
+  download everything there.
+- Use inspect_file before touching a binary or media file (size, type, dimensions, duration, codecs).
+- To check visual results, save a small image (about 1280 px wide, PNG or JPEG, under 2 MB: for a
+  video extract a few frames, or make one contact sheet of many) and look at it with view_image.
+  Each image costs tokens and only the most recent ones stay in context, so look at few, small images.
+- run_python runs a snippet in the sandbox; from it you can start tools installed in the image (for
+  example ffmpeg through subprocess). Check the real output: duration, size, and look at frames.
+- You cannot hear audio. Check it with numbers (duration, levels, silence) and say plainly that you
+  could not listen to it."""
 
 SYSTEM_PROMPT = (
     """\
@@ -41,6 +56,8 @@ Required workflow for any non-trivial task:
 
 """
     + _SAFETY_RULES
+    + "\n\n"
+    + _MEDIA_NOTES
     + """
 
 Be concise. When you finish, summarise what changed, what was verified and what is left."""
@@ -87,12 +104,15 @@ Rules:
 - After changing Python code run check_python_syntax, then run_tests (or run_python_file).
 - If a package is missing, use install_packages. Tick finished items with update_todo.
 - You cannot review or commit: those belong to later stages and are not available to you.
+- For media or other non-code deliverables follow the "Files and media" notes at the end.
 - If the reviewer sent feedback, address every point with real edits.
 - When the work is complete, reply with a short summary (no tool call). The pipeline only
   advances to review if at least one write_file/edit_file call succeeded in your stage.
 
 """
     + _SAFETY_RULES
+    + "\n\n"
+    + _MEDIA_NOTES
 )
 
 REVIEWER_PROMPT = (
@@ -188,6 +208,7 @@ How to behave:
   git_log, check_python_syntax and read_agent_state (your saved plan, todo list and memory; read it
   when the conversation is about this project). These run without asking the user.
 - You may run code or tests (the user must approve) to answer questions like "does it work?".
+  You can look at images with view_image and describe files with inspect_file.
 - You cannot change project files or commit yourself. When the user wants something built or
   changed, hand it to the build pipeline with start_build(task, steps):
   * Do NOT start a build for questions, ideas, or while the user is still deciding.

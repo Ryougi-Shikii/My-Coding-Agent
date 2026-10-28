@@ -9,10 +9,13 @@ read-only tools run automatically. Conversations are saved and can be reopened f
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import streamlit as st
 
 from agent import history, sandbox
 from agent import tools as agent_tools
+from agent import usage as usage_module
 from agent.graph import (
     MODE_HELP,
     MODES,
@@ -30,6 +33,8 @@ from agent.llm import describe_llm
 from agent.tools import STAGES, STEP_TO_STAGE, approval_mode, workspace_top_level
 
 st.set_page_config(page_title="LangGraph Coding Agent", page_icon="🛠️", layout="wide")
+
+MAX_DOWNLOAD_BYTES = 100_000_000  # download buttons hold the file in memory
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +60,7 @@ def on_mode_change() -> None:
     ss = st.session_state
     ss.mode = ss.mode_choice
     if history.get_conversation(ss.thread_id):
-        history.record(ss.thread_id, ss.mode, str(agent_tools.WORKSPACE))
+        history.record(ss.thread_id, ss.mode, str(agent_tools.workspace_for(ss.thread_id)))
 
 
 def open_conversation(row: dict) -> None:
@@ -142,7 +147,8 @@ def render_sidebar(status: dict | None, busy: bool = False) -> None:
             st.warning("Docker not available — UNSAFE local execution enabled")
         else:
             st.error("Docker not available — code will not run")
-        st.markdown(f"Image: `{sandbox.get_sandbox_image(agent_tools.WORKSPACE)}`")
+        current_ws = agent_tools.workspace_for(ss.thread_id)
+        st.markdown(f"Image: `{sandbox.get_sandbox_image(current_ws)}`")
 
         if status and status.get("stage") is not None:
             st.subheader("Pipeline" if ss.mode == "pipeline" else "Build")
@@ -169,7 +175,7 @@ def render_sidebar(status: dict | None, busy: bool = False) -> None:
                 st.caption(f"Review rounds: {status['revisions']}")
 
         st.subheader("Conversations")
-        rows = history.list_conversations(str(agent_tools.WORKSPACE), limit=12)
+        rows = history.list_conversations(agent_tools.workspace_scope(), limit=12)
         if not history.persistent():
             st.caption("History is off (CONVERSATION_DB=memory); chats last until the app stops.")
         if rows and not ss.messages and not busy:
@@ -191,14 +197,30 @@ def render_sidebar(status: dict | None, busy: bool = False) -> None:
                 ss.delete_request = row["thread_id"]
                 st.rerun()
 
+        if status and status.get("usage") and status["usage"]["total"]:
+            st.subheader("Usage")
+            st.caption(usage_module.format_usage(status["usage"]))
+
         st.subheader("Workspace")
-        st.caption(str(agent_tools.WORKSPACE))
-        entries = workspace_top_level()
+        st.caption(str(current_ws)
+                   + ("" if agent_tools.workspace_mode() == "shared" else " (this conversation only)"))
+        entries = workspace_top_level(root=current_ws)
         if entries:
             for name, is_dir in entries:
                 st.text(("📁 " if is_dir else "📄 ") + name)
         else:
             st.caption("(empty)")
+
+        outputs = agent_tools.output_files(current_ws)
+        if outputs:
+            st.subheader("Outputs")
+            for index, (rel, size) in enumerate(outputs[:20]):
+                if size > MAX_DOWNLOAD_BYTES:
+                    st.caption(f"{rel} ({size // 1_000_000} MB, too large to download here)")
+                    continue
+                st.download_button(f"⬇ {rel} ({size // 1024} KB)", data=(current_ws / rel).read_bytes(),
+                                   file_name=Path(rel).name, key=f"dl_{ss.thread_id}_{index}_{rel}",
+                                   use_container_width=True)
 
         st.divider()
         if st.button("New conversation", use_container_width=True):
